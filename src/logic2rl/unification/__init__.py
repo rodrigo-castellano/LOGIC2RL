@@ -1,0 +1,51 @@
+"""Vectorized unification — the single-step SLD grounding engine.
+
+One compact, self-contained engine (package ``sld/``) for logic programs of any arity:
+``SLD.__init__`` indexes the program (≈ Prolog ``consult``), ``SLD.derive`` runs one backward
+resolution step (the successor function the RL env drives), ``SLD.prove`` is the reference
+exhaustive solver for tests/debugging. Atom width W = max_arity + 1 is read off the program
+tensors; KGE runs W=3, the MNIST example W=6.
+
+The env drives the engine through the :class:`Grounder` contract below; a config picks the
+engine via ``build_env``'s ``engine_cls`` parameter (default :class:`SLD`). Implement :class:`Grounder`
+to swap in another resolution strategy — the builder/env need nothing else.
+"""
+from __future__ import annotations
+
+from typing import Optional, Protocol, Tuple, runtime_checkable
+
+from torch import Tensor
+
+from logic2rl.unification.sld import SLD
+
+
+@runtime_checkable
+class Grounder(Protocol):
+    """The contract the env/builder rely on — one verb + the sizing read-outs that can only
+    be known after the program is indexed. :class:`SLD` implements it."""
+
+    max_children: int      # max successors a state can derive in one step → builder sets padding_states
+    total_vocab_size: int  # token-id ceiling AND collision-free hash base (the KB's pack_base)
+    n_vars: int            # runtime-var embedder table size
+    num_rules: int         # program size (the rule-bias H provider's table size)
+
+    def derive(self, current_states: Tensor, next_var: Tensor,
+               excluded: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """One backward step: current_states ``[B, A, W]``, next_var ``[B]`` →
+        ``(derived [B, G, A, W], counts [B], next_var [B], derived_rule_idx [B, G])`` (W = max_arity+1).
+
+        Semantic contract (what the env reads off the output — a custom engine must honor it):
+          * a successor with ZERO non-padding atoms marks a completed proof — the env collapses
+            that batch entry to a single TRUE state (its termination marker);
+          * ``counts[b] == 0`` means no successor exists — the env falls back to a single FALSE
+            state (dead end);
+          * ``excluded`` ``[B, 1, W]`` (optional) is the episode's root query atom — don't unify
+            against it as a KB fact (cycle prevention);
+          * ``next_var`` is the fresh-runtime-var allocator, advanced and returned;
+          * atoms are FLAT: ``(predicate, arg1, …, arg_max_arity)`` over constant / runtime-var
+            ids — no function symbols / nested terms (Datalog-style programs).
+        """
+        ...
+
+
+__all__ = ["Grounder", "SLD"]

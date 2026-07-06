@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logic2rl"
+version = "0.1.0"
+description = "logic2rl: a logic->RL converter framework (env + SLD unification + SB3-faithful PPO/policy)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+authors = [
+    { name = "Rodrigo Castellano Ontiveros" },
+    { name = "Ying Jiao" },
+]
+
+dependencies = [
+    "torch>=2.9.0",
+    "tensordict>=0.11.0",
+    "numpy>=2.0.0",
+    "gymnasium>=1.2.0",
+    "stable-baselines3>=2.7.0",
+]
+
+[project.optional-dependencies]
+search = ["optuna>=3.6.0"]
+dev = ["pytest>=9.0.0", "ruff>=0.5.0"]
+
+# src-layout: real packages, so `pip install git+https://…/LOGIC2RL@<sha>` yields
+# an importable `logic2rl` (no sys.path bootstrap).
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+logic2rl = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
