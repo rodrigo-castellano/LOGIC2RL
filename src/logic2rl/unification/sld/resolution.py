@@ -227,13 +227,18 @@ def standardize_vars(
     constant_no: int,
     runtime_var_end_index: Optional[int],
     padding_idx: int,
-    input_states: Optional[Tensor] = None,  # [B, ?, W] parents
-    extra_new_vars: int = 15,
+    input_states: Optional[Tensor] = None,  # unused (kept for call-site compat)
+    extra_new_vars: int = 15,               # unused (kept for call-site compat)
     enforce_runtime_range: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """Offset-shift derived-state variables past the live range (out of place).
+    """Renumber derived-state variables down to the fixed runtime base (out of place).
 
-    The offset is ``next_var − min_var_in`` per batch (0 when the parents have no variables).
+    Per batch row, the smallest live var id is translated to ``constant_no + 1`` (uniform
+    shift — preserves distinctness and order, so it is substitution-safe), and
+    ``new_next_var = max renumbered var + 1``. Anchoring at the FIXED base every step keeps
+    ids linear in the per-episode distinct-var count; the previous scheme lifted the live
+    set above ``next_var`` each step, ratcheting ids quadratically with depth until they
+    overran the runtime range / embedder vocabulary on deep episodes.
     Returns ``(standardized [B, K, M, W], new_next_var [B])``."""
     device = states.device
     B, K, M, _ = states.shape
@@ -242,27 +247,18 @@ def standardize_vars(
         return states, next_var
 
     LARGE = 1_000_000
-    min_var_in = torch.full((B,), LARGE, dtype=torch.long, device=device)
-    max_var_in = torch.zeros(B, dtype=torch.long, device=device)
-    has_input_vars = torch.zeros(B, dtype=torch.bool, device=device)
-
-    if input_states is not None and input_states.numel() > 0:
-        in_args = input_states[:, :, 1:]
-        is_var_in = (in_args > constant_no) & (in_args != pad)
-        large_t = torch.tensor(LARGE, dtype=in_args.dtype, device=device)
-        min_var_in = torch.where(is_var_in, in_args, large_t).amin(dim=(-1, -2))
-        max_var_in = torch.where(is_var_in, in_args, torch.zeros_like(in_args)).amax(dim=(-1, -2))
-        has_input_vars = min_var_in < LARGE
-
-    offset = torch.where(has_input_vars, next_var - min_var_in,
-                         torch.zeros_like(next_var))
-
+    start = constant_no + 1
     args = states[:, :, :, 1:]
     is_var_out = (args > constant_no) & (args != pad)
+    has_vars = is_var_out.any(dim=(1, 2, 3))                                 # [B]
+    large_t = torch.tensor(LARGE, dtype=args.dtype, device=device)
+    min_var = torch.where(is_var_out, args, large_t).amin(dim=(1, 2, 3))     # [B]
+    offset = torch.where(has_vars, start - min_var,
+                         torch.zeros_like(next_var))
     std_args = torch.where(is_var_out, args + offset.view(B, 1, 1, 1), args)
 
     if (enforce_runtime_range or _STD_ASSERTS) and runtime_var_end_index is not None:
-        lo = ((~is_var_out) | (std_args >= (constant_no + 1))).all()
+        lo = ((~is_var_out) | (std_args >= start)).all()
         hi = ((~is_var_out) | (std_args <= runtime_var_end_index)).all()
         torch._assert_async(lo, "standardize_vars: var id below runtime range")
         torch._assert_async(hi, "standardize_vars: var id above runtime range")
@@ -270,19 +266,14 @@ def standardize_vars(
     standardized = states.clone()
     standardized[:, :, :, 1:] = std_args
 
-    max_in_shifted = torch.where(has_input_vars, max_var_in + offset,
-                                 torch.zeros_like(max_var_in))
-    new_next_var = torch.maximum(max_in_shifted, next_var + extra_new_vars) + 1
-
     # next_var MUST exceed every variable in the output: it is the base for the NEXT step's
     # rule standardize-apart. If it only equals the max live var, a fresh rule head var
     # aliases a live var in the remaining goals and the head's var↦const unification leaks
-    # that constant into them. extra_new_vars can under-count the true new-var span, so clamp
-    # to the exact max var in the standardized output.
-    out_is_var = (std_args > constant_no) & (std_args != pad)                # [B, K, M, W-1]
-    max_var_out = torch.where(out_is_var, std_args,
+    # that constant into them.
+    max_var_out = torch.where(is_var_out, std_args,
                               torch.zeros_like(std_args)).amax(dim=(1, 2, 3))   # [B]
-    new_next_var = torch.maximum(new_next_var, max_var_out + 1)
+    new_next_var = torch.maximum(max_var_out + 1,
+                                 torch.full_like(next_var, start))
 
     if (enforce_runtime_range or _STD_ASSERTS) and runtime_var_end_index is not None:
         torch._assert_async((new_next_var <= runtime_var_end_index).all(),
