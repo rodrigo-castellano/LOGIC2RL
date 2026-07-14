@@ -2,12 +2,11 @@
 
 The resolve stage of one backward SLD step, for atoms of any width W (``[pred, arg1, …]``).
 These are the ENGINE-SHARED primitives; the open-var grounding step lives beside them —
-``base/soft.py`` (soft unification) and ``join/`` (real-fact join) — used by the SLD and
-Join engines respectively.
+``base/soft.py`` (soft unification) and ``enumerate/`` (real-fact enumerate) — used by the SLD and
+Enumerate engines respectively.
 
   unify_atoms              pairwise MGU of two atom tensors
   apply_substitutions      sequential substitution of ``(from → to)`` slots
-  resolve_facts            targeted fact lookup → unify → substitute the remaining goals
   resolve_rules            rule segment lookup → standardize-apart → unify head → body + tail
   standardize_vars         derived-state variable renaming (terminal output)
 
@@ -25,7 +24,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from logic2rl.unification.base.kb import is_const, is_var
+from logic2rl.unification.base.kb import fact_contains, is_const, is_var
 
 # ==========================================================================
 # Unification primitives
@@ -89,41 +88,6 @@ def apply_substitutions(atoms: Tensor, subs: Tensor, pad: int) -> Tensor:
 # ==========================================================================
 # Fact / rule resolution (one goal slot per batch row)
 # ==========================================================================
-
-def resolve_facts(
-    queries: Tensor,               # [B, W]
-    remaining: Tensor,             # [B, L, W]
-    fact_index,
-    constant_no: int,
-    pad: int,
-    K_f: int,
-    active: Tensor,                # [B]
-    excluded: Optional[Tensor] = None,   # [B, 1, W]
-) -> Tuple[Tensor, Tensor]:
-    """Fact resolution: targeted lookup → unify → substitute the remaining goals.
-
-    Returns ``(fact_goals [B, K_f, L, W], success [B, K_f])``. ``excluded`` masks out the
-    episode's root query atom (cycle prevention)."""
-    B, W = queries.shape
-    L = remaining.shape[1]
-    facts_idx = fact_index.facts_idx
-    fact_item_idx, fact_valid = fact_index.targeted_lookup(queries, K_f)     # [B, K_f]
-    F = facts_idx.shape[0]
-    safe_idx = fact_item_idx.clamp(0, max(F - 1, 0))
-    fact_atoms = facts_idx[safe_idx.view(-1)].view(B, K_f, W)
-    q_exp = queries.unsqueeze(1).expand(-1, K_f, -1)
-    ok, subs = unify_atoms(q_exp, fact_atoms, constant_no=constant_no, pad=pad)
-    success = ok & fact_valid & active.unsqueeze(1)
-    if excluded is not None:
-        excl = excluded[:, 0, :].unsqueeze(1)                                # [B, 1, W]
-        success = success & ~(fact_atoms == excl).all(dim=-1)
-
-    subs_flat = subs.reshape(B * K_f, W - 1, 2)
-    rem_exp = remaining.unsqueeze(1).expand(-1, K_f, -1, -1).reshape(B * K_f, L, W)
-    fact_goals = apply_substitutions(rem_exp, subs_flat, pad).view(B, K_f, L, W)
-    pad_t = torch.tensor(pad, dtype=torch.long, device=queries.device)
-    fact_goals = torch.where(success.view(B, K_f, 1, 1), fact_goals, pad_t)
-    return fact_goals, success
 
 
 def resolve_rules(
@@ -262,7 +226,99 @@ def standardize_vars(
     return standardized, new_next_var
 
 
+# ==========================================================================
+# Dense pack / prune / compact (BIT-EXACT, fingerprint-locked)
+#
+# _pack_children (children axis) and _compact_atoms (atom axis) share the same
+# scatter-to-cumsum-rank idiom but are kept as separate fused implementations ON PURPOSE:
+# factoring them into one generic primitive was tried and, while bit-exact, its extra
+# cumsum/reshape work regressed the compiled train step's warm warmup past the speed gate
+# (kge/tests test_qkge[geom]: 0.39s → 0.69s, gate 0.59s).
+# ==========================================================================
+
+def _pack_children(
+    fact_goals: Tensor,     # [B, K_f, L, W]
+    fact_success: Tensor,   # [B, K_f]
+    rule_goals: Tensor,     # [B, K_r, L, W]
+    rule_success: Tensor,   # [B, K_r]
+    sub_rule_idx: Tensor,   # [B, K_r]
+    G: int,
+    pad: int,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Compact the successful children into ``G`` output slots, facts first then rules →
+    ``(goals [B, G, L, W], counts [B], rule_idx [B, G])``.
+
+    Each child scatters straight to its cumsum rank (facts fill ``[0, n_valid_f)``, rules
+    after); invalid and overflow children target one discarded trash slot ``G``, so the first
+    G children win. One scatter over the concatenated sources per output buffer (the two
+    target regions are disjoint — half the kernel launches). Fact slots carry rule id -1,
+    rule slots their top-level rule id, empty slots 0."""
+    B, K_f = fact_success.shape
+    L, W = rule_goals.shape[2], rule_goals.shape[3]
+    dev = rule_goals.device
+    trash = torch.tensor(G, dtype=torch.long, device=dev)
+
+    cs_f = fact_success.long().cumsum(dim=1)                       # [B, K_f]
+    n_valid_f = cs_f[:, -1:]                                       # [B, 1]
+    cs_r = rule_success.long().cumsum(dim=1) + n_valid_f
+    target_f = torch.where(fact_success, cs_f - 1, trash).clamp_(min=0, max=G)
+    target_r = torch.where(rule_success, cs_r - 1, trash).clamp_(min=0, max=G)
+    counts = cs_r[:, -1].clamp(max=G)
+
+    out_goals = torch.full((B, G + 1, L, W), pad, dtype=torch.long, device=dev)
+    out_rid = torch.zeros(B, G + 1, dtype=torch.long, device=dev)
+
+    tgt = torch.cat([target_r, target_f], dim=1)                   # [B, K_r + K_f]
+    out_goals.scatter_(1, tgt.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, W),
+                       torch.cat([rule_goals, fact_goals], dim=1))
+    f_neg1 = torch.full((B, K_f), -1, dtype=torch.long, device=dev)
+    out_rid.scatter_(1, tgt, torch.cat([sub_rule_idx, f_neg1], dim=1))
+
+    slot_valid = torch.arange(G, device=dev).unsqueeze(0) < counts.unsqueeze(1)
+    rule_idx = torch.where(slot_valid, out_rid[:, :G], torch.zeros((), dtype=torch.long, device=dev))
+    return out_goals[:, :G], counts, rule_idx
+
+
+def _prune_ground_facts(
+    candidates: Tensor,         # [B, K, M, W]
+    fact_hashes: Tensor,        # [F]
+    pack_base: int,
+    constant_no: int,
+    pad: int,
+    excluded: Optional[Tensor] = None,   # [B, 1, W]
+) -> Tensor:
+    """Keep-mask ``[B, K, M]`` dropping ground atoms that are known KB facts (a proven
+    subgoal resolves deterministically — remove it from the goal). The ``excluded`` root
+    query atom is NOT prunable (cycle prevention)."""
+    B, K, M, W = candidates.shape
+    preds = candidates[:, :, :, 0]
+    valid_atom = preds != pad
+    ground = (candidates[:, :, :, 1:] <= constant_no).all(dim=-1) & valid_atom
+    is_fact = fact_contains(candidates.reshape(-1, W), fact_hashes, pack_base).reshape(B, K, M)
+    is_fact = is_fact & ground
+    if excluded is not None:
+        excl = excluded[:, 0, :].unsqueeze(1).unsqueeze(1)                   # [B, 1, 1, W]
+        is_fact = is_fact & ~((candidates == excl).all(dim=-1) & ground)
+    return valid_atom & ~is_fact
+
+
+def _compact_atoms(states: Tensor, pad: int, valid: Tensor) -> Tensor:
+    """Left-align the ``valid`` atoms within each ``[..., M, W]`` slice.
+
+    Scatter-based: kept atoms write to their cumsum rank (unique by construction); dropped
+    atoms all write to one discarded trash slot ``M``."""
+    if states.numel() == 0:
+        return states
+    *leading, M, W = states.shape
+    flat = states.reshape(-1, M, W)
+    keep = valid.reshape(-1, M)
+    pos = torch.cumsum(keep, dim=1, dtype=torch.long) - 1
+    tgt = torch.where(keep, pos, M)
+    out = flat.new_full((flat.shape[0], M + 1, W), pad)
+    out.scatter_(1, tgt.unsqueeze(-1).expand(-1, -1, W), flat)
+    return out[:, :M].reshape(*leading, M, W)
+
 __all__ = [
     "unify_atoms", "apply_substitutions",
-    "resolve_facts", "resolve_rules", "standardize_vars",
+    "resolve_rules", "standardize_vars",
 ]

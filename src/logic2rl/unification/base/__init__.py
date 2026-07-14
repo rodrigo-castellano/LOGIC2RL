@@ -5,7 +5,7 @@
   soft.py        soft unification (``resolve_soft_facts``) — the neural open-var grounding
   engine.py      :class:`BaseEngine` — consult / ``derive`` / pack / prune / ``prove``
 
-The concrete engines (``sld.SLD``, ``join.Join``) extend :class:`BaseEngine`; they differ only
+The concrete engines (``sld.SLD``, ``enumerate.Enumerate``) extend :class:`BaseEngine`; they differ only
 in ``resolve_soft_facts``.
 """
 from logic2rl.unification.base.engine import BaseEngine

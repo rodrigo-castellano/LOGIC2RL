@@ -54,6 +54,14 @@ class BaseConfig:
     # suite passes the frozen reference's enumeration widths here.
     engine_extra_kwargs: Dict[str, Any] = field(default_factory=dict)
 
+    # Grounder resolution (selects the engine in build_env): 'sld' = SLD backward resolution (open
+    # vars closed by the soft hook), 'enumerate' = real-fact enumerate inside derive.
+    resolution: str = "sld"
+    # Soft open-var grounding on/off (engine soft mode; scorer app-injected). None ⇒ sld:True, enum:False.
+    soft: Optional[bool] = None
+    # Enumerate width K (real-fact fillers per open-var state). 0 = auto (app-derived).
+    enumerate_k: int = 0
+
     # Eval geometry
     eval_batch_size: Optional[int] = None  # Fixed batch size for evaluation (defaults to n_envs if None)
 
@@ -73,3 +81,8 @@ class BaseConfig:
             _s.__post_init__()
         if self.n_envs <= 0:
             raise ValueError(f"n_envs must be > 0, got {self.n_envs}")
+        if self.resolution not in ("sld", "enumerate"):
+            raise ValueError(
+                f"resolution must be 'sld' or 'enumerate', got {self.resolution!r}.")
+        if self.soft is None:  # sld ⇒ soft unification, enumerate ⇒ pure real facts
+            self.soft = (self.resolution == "sld")

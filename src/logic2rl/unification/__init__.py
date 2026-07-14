@@ -2,9 +2,9 @@
 
 Three packages: ``base/`` is the shared substrate (``BaseEngine``: consult ≈ Prolog
 ``consult``, ``derive`` = one backward step the RL env drives, ``prove`` = the reference solver;
-plus ``kb`` / ``resolution`` / ``soft``). ``sld/`` and ``join/`` are the two concrete engines —
+plus ``kb`` / ``resolution`` / ``soft``). ``sld/`` and ``enumerate/`` are the two concrete engines —
 siblings that both extend ``BaseEngine`` and differ ONLY in ``resolve_soft_facts`` (soft neural
-filler vs real-fact join). Atom width W = max_arity + 1 is read off the program tensors; KGE
+filler vs real-fact enumerate). Atom width W = max_arity + 1 is read off the program tensors; KGE
 runs W=3, the MNIST example W=6.
 
 The env drives the engine through the :class:`Grounder` contract below; a config picks the
@@ -19,7 +19,7 @@ from torch import Tensor
 
 from logic2rl.unification.base import (KB, BaseEngine, FactIndex, RuleIndex,
                                        fact_contains, is_const, is_var)
-from logic2rl.unification.join import Join
+from logic2rl.unification.enumerate import Enumerate
 from logic2rl.unification.sld import SLD
 
 
@@ -52,5 +52,5 @@ class Grounder(Protocol):
         ...
 
 
-__all__ = ["Grounder", "BaseEngine", "SLD", "Join",
+__all__ = ["Grounder", "BaseEngine", "SLD", "Enumerate",
            "KB", "FactIndex", "RuleIndex", "fact_contains", "is_const", "is_var"]

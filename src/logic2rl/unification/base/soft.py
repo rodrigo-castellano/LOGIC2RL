@@ -1,8 +1,8 @@
-"""Soft unification — the neural open-var grounding shared by the SLD and Join engines.
+"""Soft unification — the neural open-var grounding shared by the SLD and Enumerate engines.
 
 ``resolve_soft_facts`` commits each derived state's free variable to its most likely neural
 filler (the joint argmax over the state's soft atoms, returned by an attached scorer). It is
-the base ``SLD.resolve_soft_facts`` and the fallback filler in ``Join`` when ``soft`` is on — one
+the base ``SLD.resolve_soft_facts`` and the fallback filler in ``Enumerate`` when ``soft`` is on — one
 implementation, shared, so both engines score soft steps identically. Fixed-shape /
 CUDA-graph-safe (no ``.item()``, no data-dependent branching)."""
 from __future__ import annotations

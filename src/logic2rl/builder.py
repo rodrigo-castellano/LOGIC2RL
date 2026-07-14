@@ -120,8 +120,8 @@ def build_env(
     # base from constant_no + the static pool size (config.max_total_vars), and the
     # branching-derived embedder n_vars once max_children is known.
     if engine_cls is None:
-        from logic2rl.unification import SLD
-        engine_cls = SLD
+        from logic2rl.unification import SLD, Enumerate
+        engine_cls = Enumerate if getattr(config, "resolution", "sld") == "enumerate" else SLD
     vec_engine = engine_cls(
         facts_idx=mat.facts_idx,
         rules_idx=mat.rules_idx,

@@ -213,7 +213,7 @@ class FactIndex(nn.Module):
 
     def targeted_count(self, query_atoms: Tensor) -> Tensor:
         """``[B, W] -> [B]`` matching-fact count of the targeted lookup (same column
-        precedence as ``targeted_lookup``): the selectivity signal for join ordering —
+        precedence as ``targeted_lookup``): the selectivity signal for enumerate ordering —
         enumerate the goal with the smallest span first."""
         cno, pad, ks = self._constant_no, self._padding_idx, self._key_scale
         preds = query_atoms[:, 0]
