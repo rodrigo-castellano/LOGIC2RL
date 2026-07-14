@@ -1,12 +1,14 @@
-"""SLD resolution — unification primitives + fact/rule resolution + var standardization.
+"""SLD resolution primitives — unification + fact/rule resolution + var standardization.
 
-The resolve stage of one backward SLD step, for atoms of any width W (``[pred, arg1, …]``):
+The resolve stage of one backward SLD step, for atoms of any width W (``[pred, arg1, …]``).
+These are the ENGINE-SHARED primitives; the open-var grounding step lives beside them —
+``base/soft.py`` (soft unification) and ``join/`` (real-fact join) — used by the SLD and
+Join engines respectively.
 
   unify_atoms              pairwise MGU of two atom tensors
   apply_substitutions      sequential substitution of ``(from → to)`` slots
   resolve_facts            targeted fact lookup → unify → substitute the remaining goals
   resolve_rules            rule segment lookup → standardize-apart → unify head → body + tail
-  resolve_soft_facts       neural fact lookup: unify each free variable with its top filler
   standardize_vars         derived-state variable renaming (terminal output)
 
 Facts and rules are resolved independently and side by side (dense); the engine packs the
@@ -23,7 +25,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from logic2rl.unification.sld.kb import is_const, is_var
+from logic2rl.unification.base.kb import is_const, is_var
 
 # ==========================================================================
 # Unification primitives
@@ -190,27 +192,6 @@ def resolve_rules(
     return rule_goals, rule_success, sub_rule_idx
 
 
-@torch.no_grad()
-def resolve_soft_facts(
-    states: Tensor,                # [B, G, A, W] derived states
-    counts: Tensor,                # [B] valid slots per row
-    score_soft_facts,              # (states, counts) -> v* [B, G] best filler per state
-    constant_no: int,
-    pad: int,
-) -> Tensor:
-    """Soft-fact resolution: unify each derived state's free variable with its most
-    likely filler. A *soft* atom has a bound constant arg and a free variable — no KB
-    fact matches it exactly, but a neural scorer can rank every candidate binding.
-    ``score_soft_facts`` returns the top filler entity per state (the joint argmax
-    over that state's soft atoms); committing it makes the state ground. States
-    without a soft atom pass through unchanged."""
-    args = states[..., 1:]                                       # [B, G, A, W-1]
-    soft = is_var(args, constant_no, pad) & is_const(args, constant_no).any(dim=-1, keepdim=True)
-    vstar = score_soft_facts(states, counts)                     # [B, G]
-    filled = torch.where(soft, vstar.unsqueeze(-1).unsqueeze(-1), args)
-    return torch.cat([states[..., :1], filled], dim=-1)
-
-
 # ==========================================================================
 # Variable standardization (terminal output renaming)
 # ==========================================================================
@@ -283,5 +264,5 @@ def standardize_vars(
 
 __all__ = [
     "unify_atoms", "apply_substitutions",
-    "resolve_facts", "resolve_rules", "resolve_soft_facts", "standardize_vars",
+    "resolve_facts", "resolve_rules", "standardize_vars",
 ]

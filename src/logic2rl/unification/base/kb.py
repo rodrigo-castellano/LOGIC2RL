@@ -211,6 +211,30 @@ class FactIndex(nn.Module):
             valid = torch.where(use, vj, valid)
         return fact_idx, valid
 
+    def targeted_count(self, query_atoms: Tensor) -> Tensor:
+        """``[B, W] -> [B]`` matching-fact count of the targeted lookup (same column
+        precedence as ``targeted_lookup``): the selectivity signal for join ordering —
+        enumerate the goal with the smallest span first."""
+        cno, pad, ks = self._constant_no, self._padding_idx, self._key_scale
+        preds = query_atoms[:, 0]
+
+        def _count(offsets, keys, ok):
+            safe = keys.clamp(0, offsets.shape[0] - 2)
+            return torch.where(ok, offsets[safe + 1] - offsets[safe],
+                               torch.zeros_like(keys))
+
+        all_var = (preds != pad)
+        for j in range(self._n_args):
+            argj = query_atoms[:, 1 + j]
+            all_var = all_var & ~((argj <= cno) & (argj != pad))
+        cnt = _count(self._p_offsets, preds.long(), all_var)
+        for j in reversed(range(self._n_args)):
+            argj = query_atoms[:, 1 + j]
+            is_cj = (argj <= cno) & (argj != pad)
+            cj = _count(getattr(self, f"_a{j}_offsets"), (preds * ks + argj).long(), is_cj)
+            cnt = torch.where(is_cj, cj, cnt)
+        return cnt
+
     def __repr__(self) -> str:
         return f"FactIndex(F={self.num_facts}, W={self._W}, K={self._max_fact_pairs})"
 

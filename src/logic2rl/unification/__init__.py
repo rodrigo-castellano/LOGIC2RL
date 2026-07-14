@@ -1,10 +1,11 @@
-"""Vectorized unification — the single-step SLD grounding engine.
+"""Vectorized unification — the single-step SLD derivation engine, for logic programs of any arity.
 
-One compact, self-contained engine (package ``sld/``) for logic programs of any arity:
-``SLD.__init__`` indexes the program (≈ Prolog ``consult``), ``SLD.derive`` runs one backward
-resolution step (the successor function the RL env drives), ``SLD.prove`` is the reference
-exhaustive solver for tests/debugging. Atom width W = max_arity + 1 is read off the program
-tensors; KGE runs W=3, the MNIST example W=6.
+Three packages: ``base/`` is the shared substrate (``BaseEngine``: consult ≈ Prolog
+``consult``, ``derive`` = one backward step the RL env drives, ``prove`` = the reference solver;
+plus ``kb`` / ``resolution`` / ``soft``). ``sld/`` and ``join/`` are the two concrete engines —
+siblings that both extend ``BaseEngine`` and differ ONLY in ``resolve_soft_facts`` (soft neural
+filler vs real-fact join). Atom width W = max_arity + 1 is read off the program tensors; KGE
+runs W=3, the MNIST example W=6.
 
 The env drives the engine through the :class:`Grounder` contract below; a config picks the
 engine via ``build_env``'s ``engine_cls`` parameter (default :class:`SLD`). Implement :class:`Grounder`
@@ -16,6 +17,9 @@ from typing import Optional, Protocol, Tuple, runtime_checkable
 
 from torch import Tensor
 
+from logic2rl.unification.base import (KB, BaseEngine, FactIndex, RuleIndex,
+                                       fact_contains, is_const, is_var)
+from logic2rl.unification.join import Join
 from logic2rl.unification.sld import SLD
 
 
@@ -48,4 +52,5 @@ class Grounder(Protocol):
         ...
 
 
-__all__ = ["Grounder", "SLD"]
+__all__ = ["Grounder", "BaseEngine", "SLD", "Join",
+           "KB", "FactIndex", "RuleIndex", "fact_contains", "is_const", "is_var"]
