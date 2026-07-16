@@ -48,7 +48,6 @@ import torch.nn as nn
 from torch import Tensor
 
 from logic2rl.unification.base.kb import KB
-from logic2rl.unification.base.soft import fill_vars
 
 
 # ==========================================================================
@@ -87,7 +86,6 @@ class BaseEngine(nn.Module):
         derived_cap: Optional[int] = None,    # G: output slots per derive (default 256)
         full_fact_slots: bool = False,        # facts get the full budget (SB3 enumeration width)
         n_vars: Optional[int] = None,         # runtime-var table size (default: derived formula)
-        var_fill: str = "none",               # replace_candidates fill: none | soft | fact
     ):
         super().__init__()
         assert facts_idx.shape[-1] == rules_idx.shape[-1], (
@@ -121,16 +119,17 @@ class BaseEngine(nn.Module):
         self.num_rules = self.kb.rule_index.num_rules
         self.max_children = self.kb.max_children
 
-        # Open-var fill at the replace_candidates seam: 'none' (vars pass through), 'soft'
-        # (joint-scorer argmax over all entities), 'fact' (argmax over REAL-FACT fillers +
-        # no-fact discard; SLD only). With 'soft'/'fact' the app MUST attach ``joint_scorer``
-        # (the KGE joint) post-build; 'fact' additionally needs ``false_pred`` (the app's
-        # FALSE-terminal pred id) for the discard.
-        if var_fill not in ("none", "soft", "fact"):
-            raise ValueError(f"var_fill must be 'none' | 'soft' | 'fact', got {var_fill!r}")
-        self._var_fill = str(var_fill)
-        self.joint_scorer = None
-        self.false_pred: Optional[int] = None
+        # The replace_candidates seam: an OPTIONAL app-attached filler ``(states, counts) ->
+        # states`` that commits open vars (e.g. the KGE joint's soft/hard fill). None = pure
+        # resolution (vars pass through untouched). The fill semantics — argmax choice,
+        # real-fact restriction, no-filler discard — live ENTIRELY in the app's filler; the
+        # engine only delegates.
+        self.candidate_filler = None
+        # Opt-in per-env [B, L, W] proven-body scratch: when the app attaches a static
+        # buffer here, each ``derive`` stashes the env's FIRST fully-ground body (every atom
+        # a real fact — the slot that collapses to TRUE downstream) pre-compaction, so a
+        # policy can score the proof path at the TRUE accept. Works for SLD and Enumerate.
+        self._proven_body: Optional[Tensor] = None
 
         # Goal-tape width L and the pack output cap G.
         self.max_atoms = max(self._M_rl, self.kb.rule_index.M)
@@ -170,32 +169,39 @@ class BaseEngine(nn.Module):
         raise NotImplementedError("derive: use a concrete engine (SLD / Enumerate), not BaseEngine.")
 
     def replace_candidates(self, states: Tensor, counts: Tensor) -> Tensor:
-        """Post-derive candidate fill — commit each remaining free variable to a chosen filler,
-        dispatching on ``var_fill``: ``'none'`` passes states through untouched, ``'soft'`` →
-        :meth:`soft_fill_vars`, ``'fact'`` → ``fact_fill_vars`` (SLD only). Invoked ONCE per
-        final candidate set by the env's candidate generation (the end of ``UnificationLogic``'s
-        pipeline, after the unary refine). For SLD these are ALL the free vars; for
-        :class:`Enumerate` (soft variant) only the RESIDUAL its real-fact resolution left open.
+        """The post-derive candidate-fill seam — delegate to the app-attached
+        ``candidate_filler`` (``(states, counts) -> states``; e.g. the KGE joint's soft or
+        hard fill), or pass the states through untouched when none is attached. Invoked ONCE
+        per final candidate set by the env's candidate generation (the end of
+        ``UnificationLogic``'s pipeline, after the unary refine). For SLD the filler sees ALL
+        the free vars; for :class:`Enumerate` only the RESIDUAL its real-fact resolution
+        left open.
 
         This seam is SHAPE-PRESERVING by construction (proof-marking, pruning, and compaction
-        all run before it): it fills existing slots, never expands the set. Expansion (one
-        state → many groundings, the ``FactJoint``) is a resolution-level operation and lives
-        inside ``derive`` — see :class:`Enumerate`. The scorer's [S,E] GEMM lives at this seam —
-        NOT inside ``derive`` — on purpose: the unary auto-advance re-derives up to
-        ``max_unary_iterations`` times per env step, so running the GEMM in ``derive`` pays it
-        on every intermediate candidate set (~2.4x slower — measured); here it runs exactly once."""
-        if self._var_fill == "none":
+        all run before it): a filler fills existing slots, never expands the set. Expansion
+        (one state → many groundings) is a resolution-level operation and lives inside
+        ``derive`` — see :class:`Enumerate`'s ``enumerate_groundings``. A filler's [S,E] GEMM
+        lives at this seam — NOT inside ``derive`` — on purpose: the unary auto-advance
+        re-derives up to ``max_unary_iterations`` times per env step, so running it in
+        ``derive`` pays it on every intermediate candidate set (~2.4x slower — measured);
+        here it runs exactly once."""
+        if self.candidate_filler is None:
             return states
-        if self._var_fill == "fact":
-            return self.fact_fill_vars(states, counts)
-        return self.soft_fill_vars(states, counts)
+        return self.candidate_filler(states, counts)
 
-    def soft_fill_vars(self, states: Tensor, counts: Tensor) -> Tensor:
-        """SOFT fill — commit each state's free variable to the joint scorer's best assignment
-        over ALL entities (``joint_scorer.topk_assignments`` k=1, then the ``fill_vars`` commit)."""
-        assert self.joint_scorer is not None, "soft_fill_vars requires an attached joint_scorer"
-        vstar, _ = self.joint_scorer.topk_assignments(states, counts, k=1)   # [B, G, 1] each
-        return fill_vars(states, vstar[..., 0], self.kb.constant_no, self.kb.padding_idx)
+    def _stash_proven_body(self, derived: Tensor, keep: Tensor, counts: Tensor) -> None:
+        """Stash each env's FIRST fully-ground body — every atom a real fact (all pruned by
+        ``keep`` → the slot collapses to TRUE downstream) — into the opt-in ``_proven_body``
+        buffer, pre-compaction, so a policy can score the proof path at the TRUE accept.
+        Called by the concrete engines' ``derive`` when the buffer is attached."""
+        B, dev, pad = derived.shape[0], derived.device, self.padding_idx
+        present = derived[..., 0] != pad                                     # [B, G, L]
+        within = torch.arange(self.G, device=dev).unsqueeze(0) < counts.unsqueeze(1)
+        proven = within & present.any(-1) & ~(keep & present).any(-1)        # [B, G] all-fact slot
+        first = proven.to(torch.int32).argmax(1)                             # [B] first proven slot
+        pb = derived[torch.arange(B, device=dev), first]                     # [B, L, W]
+        self._proven_body.copy_(torch.where(proven.any(1).view(B, 1, 1), pb,
+                                            torch.full_like(pb, pad)))
 
     # ==================================================================
     # prove — reference exhaustive search (tests / debugging)

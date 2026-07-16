@@ -2,12 +2,14 @@
 
 Three packages: ``base/`` is the shared substrate (``BaseEngine``: consult ≈ Prolog
 ``consult``, ``derive`` = one backward step the RL env drives, ``replace_candidates`` = the
-shape-preserving open-var fill seam, ``prove`` = the reference solver; plus ``kb`` /
-``resolution`` / ``soft`` / ``joint``). ``sld/`` and ``enumerate/`` are the two concrete engines —
-siblings that both extend ``BaseEngine``: SLD resolves facts ∥ rules and fills open vars at the
-seam (``soft_fill_vars`` / ``fact_fill_vars``, per ``var_fill``); Enumerate grounds them with the
-:class:`FactJoint` inside ``derive``. Atom width W = max_arity + 1 is read off the program
-tensors; KGE runs W=3, the MNIST example W=6.
+shape-preserving seam that delegates open-var filling to an app-attached ``candidate_filler``,
+``prove`` = the reference solver; plus ``kb`` / ``resolution``). ``sld/`` and ``enumerate/`` are
+the two concrete engines — siblings that both extend ``BaseEngine`` and differ only in
+``derive``: SLD resolves facts ∥ rules (open vars persist until the seam filler — or forever,
+for open-var scoring apps); Enumerate grounds them with the reusable
+:func:`~logic2rl.unification.enumerate.enumerate_groundings` fact joint inside ``derive``.
+Atom width W = max_arity + 1 is read off the program tensors; KGE runs W=3, the MNIST
+example W=6.
 
 The env drives the engine through the :class:`Grounder` contract below; a config picks the
 engine via ``build_env``'s ``engine_cls`` parameter (default :class:`SLD`). Implement :class:`Grounder`
@@ -19,9 +21,9 @@ from typing import Optional, Protocol, Tuple, runtime_checkable
 
 from torch import Tensor
 
-from logic2rl.unification.base import (KB, BaseEngine, FactIndex, FactJoint, RuleIndex,
+from logic2rl.unification.base import (KB, BaseEngine, FactIndex, RuleIndex,
                                        fact_contains, is_const, is_var)
-from logic2rl.unification.enumerate import Enumerate
+from logic2rl.unification.enumerate import Enumerate, enumerate_groundings
 from logic2rl.unification.sld import SLD
 
 
@@ -54,5 +56,5 @@ class Grounder(Protocol):
         ...
 
 
-__all__ = ["Grounder", "BaseEngine", "SLD", "Enumerate", "FactJoint",
+__all__ = ["Grounder", "BaseEngine", "SLD", "Enumerate", "enumerate_groundings",
            "KB", "FactIndex", "RuleIndex", "fact_contains", "is_const", "is_var"]

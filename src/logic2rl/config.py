@@ -57,13 +57,14 @@ class BaseConfig:
     # Grounder resolution (selects the engine in build_env): 'sld' = SLD backward resolution (open
     # vars filled at the replace_candidates seam), 'enumerate' = real-fact enumerate inside derive.
     resolution: str = "sld"
-    # Open-var fill at the seam on/off (joint scorer app-injected). None ⇒ sld:True, enum:False.
-    # Maps to engine var_fill: off ⇒ 'none'; on ⇒ 'soft' (or 'fact' with hard_facts).
-    soft: Optional[bool] = None
-    # Fact fill (SLD): commit each open var to its best REAL-FACT filler (fact-masked argmax;
-    # no-fact states discarded to FALSE) instead of the KGE argmax over all entities — the
-    # fact-unification analogue of soft fill (engine var_fill='fact'). Needs soft on.
-    hard_facts: bool = False
+    # The replace_candidates seam fill — WHICH filler the app attaches to the engine:
+    #   'soft'  commit each open var to the scorer's best assignment over ALL entities
+    #   'hard'  commit the best REAL-FACT assignment (no-fact states discarded)
+    #   'none'  leave vars open (pure resolution; e.g. enumerate, or SLD-open scoring)
+    # None ⇒ default by resolution: sld → 'soft', enumerate → 'none' (enumerate's derive IS
+    # the fact resolution; 'soft' there fills only its residual). The fill itself lives in
+    # the app's scorer (the engine only delegates to the attached filler).
+    replace_candidates: Optional[str] = None
     # Enumerate width K (real-fact fillers per open-var state). 0 = auto (app-derived).
     enumerate_k: int = 0
 
@@ -89,11 +90,11 @@ class BaseConfig:
         if self.resolution not in ("sld", "enumerate"):
             raise ValueError(
                 f"resolution must be 'sld' or 'enumerate', got {self.resolution!r}.")
-        if self.soft is None:  # sld ⇒ soft unification, enumerate ⇒ pure real facts
-            self.soft = (self.resolution == "sld")
-        if self.hard_facts and self.resolution != "sld":
-            raise ValueError("hard_facts=True requires resolution='sld' "
-                             "(fact fill is the SLD seam method; Enumerate's derive IS the fact resolution).")
-        if self.hard_facts and not self.soft:
-            raise ValueError("hard_facts=True requires soft=True "
-                             "(fact fill rides the seam fill; soft=False leaves vars open).")
+        if self.replace_candidates is None:  # default by resolution
+            self.replace_candidates = "soft" if self.resolution == "sld" else "none"
+        if self.replace_candidates not in ("none", "soft", "hard"):
+            raise ValueError(f"replace_candidates must be 'none' | 'soft' | 'hard', "
+                             f"got {self.replace_candidates!r}.")
+        if self.replace_candidates == "hard" and self.resolution != "sld":
+            raise ValueError("replace_candidates='hard' requires resolution='sld' "
+                             "(Enumerate's derive IS the fact resolution).")
