@@ -78,7 +78,7 @@ class UnificationLogic:
                      derived_rule_idx=rule_idx, fields=fields)
         for c in env.components:
             cand = c.candidate_refine(env, cand, state)
-        return cand._replace(derived=env.engine.resolve_soft_facts(cand.derived, cand.counts))
+        return cand._replace(derived=env.engine.replace_candidates(cand.derived, cand.counts))
 
     def _compute_initial(self, queries: Tensor) -> "_Cand":
         """Candidate generation for a freshly-reset env — the reset twin of
@@ -97,7 +97,7 @@ class UnificationLogic:
                      derived_rule_idx=rule_idx, fields=fields)
         for c in env.components:
             cand = c.candidate_refine(env, cand, None)
-        return cand._replace(derived=env.engine.resolve_soft_facts(cand.derived, cand.counts))
+        return cand._replace(derived=env.engine.replace_candidates(cand.derived, cand.counts))
 
     def _derive_step(self, current_states: Tensor, next_var_indices: Tensor,
                      fields: Dict[str, Tensor], state,

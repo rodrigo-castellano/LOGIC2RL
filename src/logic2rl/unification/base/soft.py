@@ -1,11 +1,14 @@
-"""Soft unification — the neural open-var grounding shared by the SLD and Enumerate engines.
+"""Soft-fill commit — write a chosen variable assignment into derived states.
 
-``resolve_soft_facts`` commits each derived state's free variable to its most likely neural
-filler (the joint argmax over the state's soft atoms, returned by an attached scorer). It is
-the base ``SLD.resolve_soft_facts`` and the fallback filler in ``Enumerate`` when ``soft`` is on — one
-implementation, shared, so both engines score soft steps identically. Fixed-shape /
+``fill_vars`` is the pure commit primitive shared by the engines' ``*_fill_vars`` methods
+(``BaseEngine.soft_fill_vars`` / ``SLD.fact_fill_vars``): given the filler entity ``v*`` per
+state (chosen by an app-attached joint scorer), it writes ``v*`` into every free-variable slot
+of each state's soft atoms. With ``no_fact`` + ``false_pred`` it instead discards states that
+have NO real-fact filler (fact fill) by replacing them with a FALSE terminal. Fixed-shape /
 CUDA-graph-safe (no ``.item()``, no data-dependent branching)."""
 from __future__ import annotations
+
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -14,26 +17,33 @@ from logic2rl.unification.base.kb import is_const, is_var
 
 
 @torch.no_grad()
-def resolve_soft_facts(
+def fill_vars(
     states: Tensor,                # [B, G, A, W] derived states
-    counts: Tensor,                # [B] valid slots per row
-    score_soft_facts,              # (states, counts) -> v* [B, G] best filler per state
+    vstar: Tensor,                 # [B, G] filler entity per state (the joint argmax)
     constant_no: int,
     pad: int,
+    no_fact: Optional[Tensor] = None,    # [B, G] states with NO real-fact filler (fact fill)
+    false_pred: Optional[int] = None,    # FALSE-terminal pred; with no_fact set, discard those
 ) -> Tensor:
-    """Soft-fact resolution: unify each derived state's free variable with its most
-    likely filler. A *soft* atom has a bound constant arg and a free variable — no KB
-    fact matches it exactly, but a neural scorer can rank every candidate binding.
-    ``score_soft_facts`` returns the top filler entity per state (the joint argmax
-    over that state's soft atoms); committing it makes the state ground. States
-    without a soft atom pass through unchanged. A scorer is always required (the caller only
-    invokes this when soft grounding is on)."""
-    assert score_soft_facts is not None, "resolve_soft_facts requires a soft_scorer"
+    """Commit the chosen filler: unify each derived state's free variable with ``v*``.
+    A *soft* atom has a bound constant arg and a free variable — no KB fact matches it
+    exactly, but a joint scorer can rank every candidate binding. Committing ``v*`` makes
+    the state ground; states without a soft atom pass through unchanged.
+
+    **Discard (fact fill).** A ``no_fact`` state is an open-var state with NO real-KB-fact
+    filler. With ``false_pred`` set, such a state is replaced by a single-atom FALSE terminal
+    (the env's ``any-FALSE ⇒ fail``) — the branch is discarded instead of committing a
+    garbage entity. Without ``no_fact``/``false_pred`` (soft fill) every state commits."""
     args = states[..., 1:]                                       # [B, G, A, W-1]
     soft = is_var(args, constant_no, pad) & is_const(args, constant_no).any(dim=-1, keepdim=True)
-    vstar = score_soft_facts(states, counts)                     # [B, G]
     filled = torch.where(soft, vstar.unsqueeze(-1).unsqueeze(-1), args)
-    return torch.cat([states[..., :1], filled], dim=-1)
+    result = torch.cat([states[..., :1], filled], dim=-1)
+    if no_fact is not None and false_pred is not None:
+        B, G, A, W = result.shape
+        false_state = torch.full((A, W), pad, dtype=result.dtype, device=result.device)
+        false_state[0, 0] = int(false_pred)                     # [A, W] = FALSE atom + padding
+        result = torch.where(no_fact.view(B, G, 1, 1), false_state.view(1, 1, A, W), result)
+    return result
 
 
-__all__ = ["resolve_soft_facts"]
+__all__ = ["fill_vars"]

@@ -55,10 +55,15 @@ class BaseConfig:
     engine_extra_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     # Grounder resolution (selects the engine in build_env): 'sld' = SLD backward resolution (open
-    # vars closed by the soft hook), 'enumerate' = real-fact enumerate inside derive.
+    # vars filled at the replace_candidates seam), 'enumerate' = real-fact enumerate inside derive.
     resolution: str = "sld"
-    # Soft open-var grounding on/off (engine soft mode; scorer app-injected). None ⇒ sld:True, enum:False.
+    # Open-var fill at the seam on/off (joint scorer app-injected). None ⇒ sld:True, enum:False.
+    # Maps to engine var_fill: off ⇒ 'none'; on ⇒ 'soft' (or 'fact' with hard_facts).
     soft: Optional[bool] = None
+    # Fact fill (SLD): commit each open var to its best REAL-FACT filler (fact-masked argmax;
+    # no-fact states discarded to FALSE) instead of the KGE argmax over all entities — the
+    # fact-unification analogue of soft fill (engine var_fill='fact'). Needs soft on.
+    hard_facts: bool = False
     # Enumerate width K (real-fact fillers per open-var state). 0 = auto (app-derived).
     enumerate_k: int = 0
 
@@ -86,3 +91,9 @@ class BaseConfig:
                 f"resolution must be 'sld' or 'enumerate', got {self.resolution!r}.")
         if self.soft is None:  # sld ⇒ soft unification, enumerate ⇒ pure real facts
             self.soft = (self.resolution == "sld")
+        if self.hard_facts and self.resolution != "sld":
+            raise ValueError("hard_facts=True requires resolution='sld' "
+                             "(fact fill is the SLD seam method; Enumerate's derive IS the fact resolution).")
+        if self.hard_facts and not self.soft:
+            raise ValueError("hard_facts=True requires soft=True "
+                             "(fact fill rides the seam fill; soft=False leaves vars open).")

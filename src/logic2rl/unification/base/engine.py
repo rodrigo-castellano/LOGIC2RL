@@ -1,7 +1,7 @@
 """BaseEngine — the vectorized single-step SLD derivation engine over a fixed program (any arity).
 
-The shared substrate; the concrete engines (``sld.SLD`` soft / ``enumerate.Enumerate`` real-fact) extend it
-and differ only in ``resolve_soft_facts``.
+The shared substrate; the concrete engines (``sld.SLD`` / ``enumerate.Enumerate``) extend it
+and differ only in ``derive`` and the available ``*_fill_vars`` methods.
 
 
 The Prolog resolution core minus the control strategy. A classical Prolog engine couples
@@ -15,11 +15,12 @@ picks the branch. The engine therefore exposes the two Prolog verbs that remain:
   derive     the SLD successor function — ONE backward resolution step from each goal state:
              select the leftmost atom → resolve against facts ∥ rule heads → pack the
              children densely → prune subgoals that are known facts → standardize variables.
-             Open vars are committed separately by ``resolve_soft_facts`` (soft unification when a
-             ``soft_scorer`` is attached — each free variable is unified with its most likely
-             neural filler; :class:`Enumerate` overrides it to ground with a real KB fact) —
-             invoked ONCE per final candidate set by the env's candidate generation, at the end
-             of ``UnificationLogic``'s candidate pipeline, so delivered candidates leave ground.
+             Open vars are committed separately by ``replace_candidates`` (dispatching on
+             ``var_fill`` to ``soft_fill_vars`` — the joint-scorer argmax over all entities —
+             or ``SLD.fact_fill_vars`` — the argmax over REAL-FACT fillers, no-fact states
+             discarded) — invoked ONCE per final candidate set by the env's candidate
+             generation, at the end of ``UnificationLogic``'s candidate pipeline, so delivered
+             candidates leave ground.
   prove      ≈ solve/1 — reference exhaustive breadth-first search over ``derive``
              (tests/debugging only; the RL path never calls it).
 
@@ -47,7 +48,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from logic2rl.unification.base.kb import KB
-from logic2rl.unification.base.soft import resolve_soft_facts as _resolve_soft_facts
+from logic2rl.unification.base.soft import fill_vars
 
 
 # ==========================================================================
@@ -58,9 +59,9 @@ class BaseEngine(nn.Module):
     """Single-step SLD derivation engine over a fixed program (see the module docstring).
 
     The shared substrate for the concrete engines: :class:`~logic2rl.unification.sld.SLD`
-    (soft open-var resolution) and :class:`~logic2rl.unification.enumerate.Enumerate` (real-fact enumerate) —
-    siblings that both extend this and differ ONLY in :meth:`resolve_soft_facts`. Not
-    instantiated directly.
+    (open-var resolution, vars filled at the ``replace_candidates`` seam) and
+    :class:`~logic2rl.unification.enumerate.Enumerate` (real-fact enumerate inside ``derive``) —
+    siblings that both extend this. Not instantiated directly.
 
     Sizing attributes read by the builder/env (the ``Grounder`` contract): ``max_children``
     (branching budget → padding_states), ``total_vocab_size`` (token-id ceiling + hash base),
@@ -86,7 +87,7 @@ class BaseEngine(nn.Module):
         derived_cap: Optional[int] = None,    # G: output slots per derive (default 256)
         full_fact_slots: bool = False,        # facts get the full budget (SB3 enumeration width)
         n_vars: Optional[int] = None,         # runtime-var table size (default: derived formula)
-        soft: bool = False,                   # soft open-var grounding on (SLD hook / Enumerate derive)
+        var_fill: str = "none",               # replace_candidates fill: none | soft | fact
     ):
         super().__init__()
         assert facts_idx.shape[-1] == rules_idx.shape[-1], (
@@ -120,10 +121,16 @@ class BaseEngine(nn.Module):
         self.num_rules = self.kb.rule_index.num_rules
         self.max_children = self.kb.max_children
 
-        # Soft open-var grounding: on/off flag (``_soft``) + the app-attached scorer (nn.Module). When on,
-        # the scorer MUST be attached (SLD grounds at the hook, Enumerate fills its residual); else off.
-        self._soft = bool(soft)
-        self.soft_scorer = None
+        # Open-var fill at the replace_candidates seam: 'none' (vars pass through), 'soft'
+        # (joint-scorer argmax over all entities), 'fact' (argmax over REAL-FACT fillers +
+        # no-fact discard; SLD only). With 'soft'/'fact' the app MUST attach ``joint_scorer``
+        # (the KGE joint) post-build; 'fact' additionally needs ``false_pred`` (the app's
+        # FALSE-terminal pred id) for the discard.
+        if var_fill not in ("none", "soft", "fact"):
+            raise ValueError(f"var_fill must be 'none' | 'soft' | 'fact', got {var_fill!r}")
+        self._var_fill = str(var_fill)
+        self.joint_scorer = None
+        self.false_pred: Optional[int] = None
 
         # Goal-tape width L and the pack output cap G.
         self.max_atoms = max(self._M_rl, self.kb.rule_index.M)
@@ -152,7 +159,7 @@ class BaseEngine(nn.Module):
         """One backward resolution step (the successor function) → ``(derived [B, G, L, W],
         counts [B], next_var [B], derived_rule_idx [B, G])``. COMPULSORY — each concrete engine
         implements it: :class:`~logic2rl.unification.sld.SLD` resolves the leftmost atom against
-        facts ∥ rules (free vars stay open, committed at the ``resolve_soft_facts`` hook);
+        facts ∥ rules (free vars stay open, committed at the ``replace_candidates`` seam);
         :class:`~logic2rl.unification.enumerate.Enumerate` enumerates the real-fact groundings of each rule
         body. ``prove`` and the RL env drive it polymorphically.
 
@@ -162,23 +169,33 @@ class BaseEngine(nn.Module):
         fresh-runtime-var allocator, advanced and returned; atoms are FLAT ``(pred, arg1, …)``."""
         raise NotImplementedError("derive: use a concrete engine (SLD / Enumerate), not BaseEngine.")
 
-    def resolve_soft_facts(self, states: Tensor, counts: Tensor) -> Tensor:
-        """Post-derive SOFT-fact resolution — commit each remaining free variable with its neural
-        argmax filler (the ``base.soft.resolve_soft_facts`` primitive), when ``soft`` is on. Invoked
-        ONCE per final candidate set by the env's candidate generation (the end of
-        ``UnificationLogic``'s pipeline, after the unary refine). For SLD these are ALL the free
-        vars; for :class:`Enumerate` (soft variant) only the RESIDUAL its real-fact resolution left open
-        (pure enumerate / pure sld leave it a no-op — no free vars remain).
+    def replace_candidates(self, states: Tensor, counts: Tensor) -> Tensor:
+        """Post-derive candidate fill — commit each remaining free variable to a chosen filler,
+        dispatching on ``var_fill``: ``'none'`` passes states through untouched, ``'soft'`` →
+        :meth:`soft_fill_vars`, ``'fact'`` → ``fact_fill_vars`` (SLD only). Invoked ONCE per
+        final candidate set by the env's candidate generation (the end of ``UnificationLogic``'s
+        pipeline, after the unary refine). For SLD these are ALL the free vars; for
+        :class:`Enumerate` (soft variant) only the RESIDUAL its real-fact resolution left open.
 
-        The soft [S,E] GEMM lives at this seam — NOT inside ``derive`` — on purpose: the unary
-        auto-advance re-derives up to ``max_unary_iterations`` times per env step, so running the
-        GEMM in ``derive`` pays it on every intermediate candidate set (~2.4x slower — measured),
-        whereas here it runs exactly once. Enumerate's real-fact resolution is cheap (a fact lookup, no
-        GEMM), so THAT lives in ``derive`` as a proper resolution method — see :class:`Enumerate`."""
-        if not self._soft:
+        This seam is SHAPE-PRESERVING by construction (proof-marking, pruning, and compaction
+        all run before it): it fills existing slots, never expands the set. Expansion (one
+        state → many groundings, the ``FactJoint``) is a resolution-level operation and lives
+        inside ``derive`` — see :class:`Enumerate`. The scorer's [S,E] GEMM lives at this seam —
+        NOT inside ``derive`` — on purpose: the unary auto-advance re-derives up to
+        ``max_unary_iterations`` times per env step, so running the GEMM in ``derive`` pays it
+        on every intermediate candidate set (~2.4x slower — measured); here it runs exactly once."""
+        if self._var_fill == "none":
             return states
-        return _resolve_soft_facts(states, counts, self.soft_scorer,
-                                   self.kb.constant_no, self.kb.padding_idx)
+        if self._var_fill == "fact":
+            return self.fact_fill_vars(states, counts)
+        return self.soft_fill_vars(states, counts)
+
+    def soft_fill_vars(self, states: Tensor, counts: Tensor) -> Tensor:
+        """SOFT fill — commit each state's free variable to the joint scorer's best assignment
+        over ALL entities (``joint_scorer.topk_assignments`` k=1, then the ``fill_vars`` commit)."""
+        assert self.joint_scorer is not None, "soft_fill_vars requires an attached joint_scorer"
+        vstar, _ = self.joint_scorer.topk_assignments(states, counts, k=1)   # [B, G, 1] each
+        return fill_vars(states, vstar[..., 0], self.kb.constant_no, self.kb.padding_idx)
 
     # ==================================================================
     # prove — reference exhaustive search (tests / debugging)

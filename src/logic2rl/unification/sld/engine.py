@@ -1,10 +1,12 @@
-"""SLD engine — SLD backward resolution (facts ∥ rules) with soft open-var grounding at the hook.
+"""SLD engine — SLD backward resolution (facts ∥ rules) with open-var fill at the seam.
 
 :class:`SLD` extends :class:`~logic2rl.unification.base.engine.BaseEngine` with the SLD-specific
 resolution: one step resolves the leftmost goal atom against facts AND rule heads *in parallel*
-(``resolve_facts`` ∥ ``resolve_rules``); free variables stay open and are committed by the shared
-``BaseEngine.resolve_soft_facts`` hook (when ``soft`` is on — else they persist / the KGE app rejects
-pure SLD). Sibling of :class:`~logic2rl.unification.enumerate.Enumerate` (the real-fact enumerate engine); both
+(``resolve_facts`` ∥ ``resolve_rules``); free variables stay open and are committed by the
+``replace_candidates`` seam — ``soft_fill_vars`` (joint-scorer argmax over all entities) or
+:meth:`SLD.fact_fill_vars` (argmax over REAL-FACT fillers, no-fact states discarded to FALSE),
+per ``var_fill``. With ``var_fill='none'`` vars persist (the KGE app rejects pure SLD). Sibling
+of :class:`~logic2rl.unification.enumerate.Enumerate` (the real-fact enumerate engine); both
 extend ``BaseEngine``, neither inherits the other. ``resolve_facts`` lives here because only SLD's
 step resolves the leftmost atom against facts — Enumerate's real-fact resolution is the body enumerate.
 """
@@ -19,6 +21,7 @@ from logic2rl.unification.base.engine import BaseEngine
 from logic2rl.unification.base.resolution import (_compact_atoms, _pack_children,
                                                   _prune_ground_facts, apply_substitutions,
                                                   resolve_rules, standardize_vars, unify_atoms)
+from logic2rl.unification.base.soft import fill_vars
 
 
 def resolve_facts(
@@ -61,6 +64,17 @@ def resolve_facts(
 class SLD(BaseEngine):
     """SLD backward resolution — see the module docstring."""
 
+    def fact_fill_vars(self, states: Tensor, counts: Tensor) -> Tensor:
+        """FACT fill — commit each state's free variable to the joint scorer's best REAL-FACT
+        assignment (``joint_scorer.topk_fact_assignments`` k=1); a state with NO real-fact
+        filler is discarded to a FALSE terminal (``no_fact`` + the app-attached ``false_pred``)
+        instead of committing a garbage entity. The fact-unification analogue of soft fill."""
+        assert self.joint_scorer is not None, "fact_fill_vars requires an attached joint_scorer"
+        assert self.false_pred is not None, "fact_fill_vars requires false_pred (the discard target)"
+        vstar, _, no_fact = self.joint_scorer.topk_fact_assignments(states, counts, k=1)
+        return fill_vars(states, vstar[..., 0], self.kb.constant_no, self.kb.padding_idx,
+                         no_fact=no_fact, false_pred=self.false_pred)
+
     @torch.no_grad()
     def derive(self, current_states: Tensor, next_var_indices: Tensor,
                excluded_queries: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -68,7 +82,7 @@ class SLD(BaseEngine):
         derived_rule_idx [B, G])``. Resolve the leftmost goal atom against facts ∥ rules, pack the
         children densely, prune subgoals that are known facts, standardize. Vocab-free: a
         fully-resolved proof is a zero-atom valid slot, a dead end is ``counts == 0``; free vars stay
-        open (committed later by the ``resolve_soft_facts`` hook)."""
+        open (committed later at the ``replace_candidates`` seam)."""
         kb = self.kb
         pad = kb.padding_idx
         B, A_in, W = current_states.shape
