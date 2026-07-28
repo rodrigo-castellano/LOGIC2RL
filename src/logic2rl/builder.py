@@ -138,8 +138,21 @@ def build_env(
         **dict(config.engine_extra_kwargs),
     )
     if config.padding_states is None:
-        config.padding_states = vec_engine.max_children
-        logger.info("[Engine] padding_states (max_children) auto-calculated: %d", config.padding_states)
+        if getattr(config, "tight_action_slots", False):
+            # Bound the action width by what the engine can actually EMIT per derive
+            # (pack_children's G), not by the KB's branching budget: higher slots are
+            # unreachable, yet every per-slot kernel pays for them.
+            margin = int(getattr(config, "action_slots_margin", 0))
+            config.padding_states = min(vec_engine.max_children, vec_engine.G) + margin
+            logger.info("[Engine] padding_states (tight: min(max_children=%d, pack G=%d) + "
+                        "margin %d) = %d", vec_engine.max_children, vec_engine.G, margin,
+                        config.padding_states)
+        else:
+            config.padding_states = vec_engine.max_children
+            logger.info("[Engine] padding_states (max_children) auto-calculated: %d "
+                        "(engine pack G=%d ⇒ %d action slots are structurally unreachable; "
+                        "see tight_action_slots)", config.padding_states, vec_engine.G,
+                        max(0, config.padding_states - vec_engine.G))
     logger.info("[Embedder] n_vars (runtime var table) = %d (max_children=%d)",
                 vec_engine.n_vars, vec_engine.max_children)
 

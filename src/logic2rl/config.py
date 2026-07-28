@@ -31,7 +31,24 @@ class BaseConfig:
     n_envs: int = 256
     max_steps: int = 20            # proof depth (max_depth in the env)
     padding_atoms: int = 6
-    padding_states: Optional[int] = None  # None ⇒ derived from the engine's max_children at build
+    padding_states: Optional[int] = None  # None ⇒ derived at build (see tight_action_slots)
+    # How to DERIVE padding_states (the RL action-slot width) when it is None.
+    #   False (default): the KB's branching budget, engine.max_children.
+    #   True:  min(max_children, engine.G) + action_slots_margin — the engine's per-derive PACK
+    #          width. The KB may CONSIDER max_children candidates, but ``pack_children`` never
+    #          emits more than G (default 256), so higher slots are structurally unreachable
+    #          while every per-slot kernel still pays for them (measured: 53% of the action
+    #          slots dead at max_children=550, G=256).
+    # Off by default because narrowing the action space changes the shape of a policy with a
+    # per-action head (e.g. PPO's MLP output layer); it is exactly neutral for per-slot scorers
+    # that mask invalid slots to -inf (e.g. Q_KGE).
+    tight_action_slots: bool = False
+    # Extra action slots the app's components APPEND beyond the engine's own children (the
+    # voluntary stop actions dropped in by candidate_refine). Only meaningful with
+    # tight_action_slots. Set it to the app's max appended-stop count n: counts ≤ engine.G by
+    # construction, so with margin ≥ n an app-side `counts.clamp(max=padding_states-n)` guard
+    # can never evict a real candidate.
+    action_slots_margin: int = 0
     atom_embedding_size: int = 64
     state_embedding_size: Optional[int] = None  # derived from atom_embedding_size
     verbose: bool = True
