@@ -106,7 +106,9 @@ def _run_one(
 ) -> None:
     """Build the config + RunContext for one run and execute it (the bundle lifecycle).
 
-    Unknown override keys are dropped (only ``config_cls`` init fields are kept).
+    Unknown override keys RAISE (only ``config_cls`` init fields are accepted) — dropping
+    them silently meant a stale or misspelled ``--set`` ran the default arm under the name
+    of the one you asked for, which is invisible in the results.
     Run-bundle metadata comes from the config's duck-typed ``family()`` /
     ``signature()`` / ``logging_config()`` methods.
     """
@@ -116,7 +118,13 @@ def _run_one(
     preset_fn = getattr(config_cls, "preset_overrides", None)
     preset = dict(preset_fn(overrides) or {}) if callable(preset_fn) else {}
     merged = {**preset, **overrides}
-    cfg = config_cls(**{k: v for k, v in merged.items() if k in valid})
+    if unknown := sorted(set(merged) - valid):
+        raise ValueError(
+            f"Unknown config key(s) for {config_cls.__name__}: {', '.join(unknown)}. "
+            f"Check the spelling, or the flag may have been renamed/removed — a run with a "
+            f"key this config does not define would otherwise use the default silently."
+        )
+    cfg = config_cls(**merged)
     ctx = RunContext(
         logging=cfg.logging_config(), family=cfg.family(), signature=cfg.signature(),
         seed=int(getattr(cfg, "seed", 0)), resolved_config=cfg,
