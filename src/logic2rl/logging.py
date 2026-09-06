@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import re
+import socket
+import subprocess
 import sys
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -70,6 +72,31 @@ def _json_default(o: Any) -> Any:
 
 def _dumps(payload: Any) -> str:
     return json.dumps(payload, default=_json_default, indent=2, sort_keys=True) + "\n"
+
+
+def _environment() -> dict[str, Any]:
+    """Provenance stamped into the manifest: git HEAD of the cwd, GPU, torch, host, argv."""
+    try:
+        git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True).stdout.strip() or None
+    except Exception:
+        git = None
+    return {"git": git, "torch": torch.__version__, "host": socket.gethostname(), "argv": sys.argv,
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}
+
+
+def find_run(output_root: str, family: str, signature: str, seed: Optional[int] = None,
+             status: str = "completed") -> Optional[Path]:
+    """The newest bundle of ``(family, signature[, seed])`` under ``output_root/runs`` whose
+    manifest reports ``status`` (None when there is none) — the resumability probe."""
+    pat = f"*_{sanitize_slug(signature)}_s{'*' if seed is None else int(seed)}"
+    for d in sorted((Path(output_root).expanduser() / "runs" / sanitize_slug(family)).glob(pat), reverse=True):
+        try:
+            if json.loads((d / "manifest.json").read_text())["run"]["status"] == status:
+                return d
+        except Exception:
+            continue
+    return None
 
 
 class _TeeStream:
@@ -138,6 +165,7 @@ class RunContext:
         self._saved_model_path: Optional[Path] = None
         self._saved_model_info: Optional[dict[str, Any]] = None
         self._metrics: dict[str, list] = {"train": [], "val": [], "test": []}
+        self.environment = _environment()
 
         for directory in (self.experiment_root, self.root, self.artifacts_dir):
             directory.mkdir(parents=True, exist_ok=True)
@@ -161,6 +189,7 @@ class RunContext:
                 "model_path": str(self._saved_model_path) if self._saved_model_path else None,
             },
             "model": self._saved_model_info,
+            "environment": self.environment,
             "final_metrics": final_metrics,
         }
         (self.root / "manifest.json").write_text(_dumps(manifest))
@@ -248,4 +277,4 @@ class RunContext:
         self._write_manifest(status=status, error=error, final_metrics=dict(final_metrics))
 
 
-__all__ = ["LoggingConfig", "ModelConfig", "RunContext", "sanitize_slug"]
+__all__ = ["LoggingConfig", "ModelConfig", "RunContext", "find_run", "sanitize_slug"]

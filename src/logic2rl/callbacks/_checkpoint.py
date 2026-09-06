@@ -164,7 +164,9 @@ class CheckpointCallback(BaseCallback):
             if isinstance(self.load_model, str) and self.load_model in ["eval", "train"]:
                 load_metric = self.load_model
 
-            self.load_best_model(load_metric=load_metric)
+            if not self.load_best_model(load_metric=load_metric):
+                raise FileNotFoundError(f"load_model={self.load_model!r}: no checkpoint found "
+                                        f"(run-local {self._single_model_path})")
 
     def on_iteration_end(self) -> bool:
         """Consumer: read the shared metrics dict and save the best/last model."""
@@ -193,6 +195,8 @@ class CheckpointCallback(BaseCallback):
 
     def check_and_save(self, metrics: Dict[str, Any], iteration: int, global_step: Optional[int] = None) -> None:
         """Called manually or by Manager if we enhance the API."""
+        if self.save_mode == "none":
+            return
 
         if self.single_file:
             if self.save_mode == "best":

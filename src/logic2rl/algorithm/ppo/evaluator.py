@@ -3,8 +3,8 @@
 ``Evaluator`` runs a deterministic policy rollout and reports a results dict
 ``{"metrics": {...}, "stats": {...}, "config": {...}}``. It owns its own compiled
 eval step (argmax + ``env.step_core``), like the KGE ranking layer owns its pooled
-step — evaluation compiles where it runs. The KGE ranking/MRR layer subclasses it
-(:class:`algorithms.ppo.evaluator_kge.KGEEvaluator`).
+step — evaluation compiles where it runs. The app's ranking evaluator subclasses it
+(KGE: ``kge/evaluator_kge.py``).
 """
 from __future__ import annotations
 

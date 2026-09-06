@@ -30,7 +30,7 @@ def run(config, *, build_env: Callable, build_algorithm: Callable) -> Dict[str, 
     then evaluate; returns ``{results, algorithm, env, policy}``.
 
     Eval belongs to the algorithm: ``algorithm.evaluate()`` runs the task's
-    full evaluation (KGE → corruption MRR; generic → reward eval). ``learn()`` owns
+    full evaluation (the app's evaluator, e.g. ranking; generic → reward eval). ``learn()`` owns
     the eval-only path (fires the callbacks' ``on_training_start`` then skips
     training when ``total_timesteps <= 0``).
     """
@@ -98,7 +98,18 @@ def parse_scalar(text: str) -> Any:
     return text
 
 
-def _run_one(
+def parse_overrides(entries: Iterable[str]) -> Dict[str, Any]:
+    """``["k=v", ...]`` → typed overrides (the ``--set`` syntax)."""
+    out: Dict[str, Any] = {}
+    for entry in entries:
+        if "=" not in entry:
+            raise ValueError(f"--set expects KEY=VALUE, got {entry!r}")
+        key, _, raw = entry.partition("=")
+        out[key.strip()] = parse_scalar(raw)
+    return out
+
+
+def run_one(
     overrides: Mapping[str, Any],
     *,
     config_cls: Type,
@@ -155,6 +166,7 @@ def run_cli(
     description: str = "",
     extras_handler: Optional[Callable[[argparse.Namespace, dict], None]] = None,
     grid_exclude: Iterable[str] = ("seed",),
+    argv: Optional[list] = None,
 ) -> None:
     """Parse ``--set`` / ``--grid``, expand the grid × seed loop, and run each combo.
 
@@ -172,14 +184,9 @@ def run_cli(
                         help="Grid sweep, e.g. --grid dataset=family,fb15k237.")
     parser.add_argument("--eval", action="store_true", help="Shortcut interpreted by extras_handler.")
     parser.add_argument("--profile", action="store_true", help="Shortcut interpreted by extras_handler.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    overrides: dict[str, Any] = {}
-    for entry in args.set:
-        if "=" not in entry:
-            raise ValueError(f"--set expects KEY=VALUE, got {entry!r}")
-        key, _, raw = entry.partition("=")
-        overrides[key.strip()] = parse_scalar(raw)
+    overrides = parse_overrides(args.set)
     if extras_handler is not None:
         extras_handler(args, overrides)
 
@@ -212,4 +219,4 @@ def run_cli(
                 run_overrides["seed"] = seed
                 if has_seed_run_i:
                     run_overrides["seed_run_i"] = seed
-            _run_one(run_overrides, config_cls=config_cls, run_experiment=run_experiment)
+            run_one(run_overrides, config_cls=config_cls, run_experiment=run_experiment)

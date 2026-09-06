@@ -255,7 +255,7 @@ def build_callbacks(
 
     callbacks.extend(eval_callbacks)
 
-    if config.save_model and save_path is not None:
+    if (config.save_model or config.load_model) and save_path is not None:
         callbacks.append(checkpoint_cls(
             save_path=save_path, policy=algorithm.policy,
             train_metric="ep_rew_mean", eval_metric=eval_metric,
