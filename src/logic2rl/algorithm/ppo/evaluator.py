@@ -67,20 +67,20 @@ class Evaluator:
         return float(rewards.mean()), float(rewards.std(unbiased=False))   # np.std: ddof=0
 
     def evaluate(self, queries=None, *, config=None, max_steps=None, **_) -> dict:
-        """Eval entry, returns ``{"metrics", "stats", "config"}``. Full test split when
-        ``queries is None`` (reward rollout reporting success rate), else the given queries."""
+        """Eval entry: one FLAT dict of this evaluation's results, the task's to extend.
+
+        Full test split when ``queries is None`` (reward rollout reporting success rate),
+        else the given queries."""
         config = config or self.ppo.config
         if queries is None:
             queries = getattr(self.ppo.env, "test_queries", None)
             if queries is None:
-                return {"metrics": {}, "stats": {}, "config": {}}
+                return {}
         max_steps = max_steps or getattr(config, "eval_max_depth", None)
         rewards, lengths = self.evaluate_policy(queries, max_steps=max_steps, return_episode_rewards=True)
-        return {"metrics": {}, "config": {}, "stats": {
-            "success_rate": float((rewards > 0).float().mean().item()),
-            "mean_reward": float(rewards.mean().item()),
-            "ep_len_mean": float(lengths.float().mean().item()),
-        }}
+        return {"success_rate": float((rewards > 0).float().mean().item()),
+                "mean_reward": float(rewards.mean().item()),
+                "ep_len_mean": float(lengths.float().mean().item())}
 
 
 __all__ = ["Evaluator"]

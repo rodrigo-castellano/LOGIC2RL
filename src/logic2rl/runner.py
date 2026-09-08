@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import ast
 import logging
+import time
 import traceback
 from dataclasses import fields
 from itertools import product
@@ -20,7 +21,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Type
 import torch
 
 from logic2rl.logging import RunContext
-from logic2rl.utils import seed_all
+from logic2rl.utils import scalars, seed_all
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +55,7 @@ def run(config, *, build_env: Callable, build_algorithm: Callable) -> Dict[str, 
 
     algorithm.learn(total_timesteps=config.total_timesteps)
 
-    eval_results = algorithm.evaluate()
-    for k in ('policy_loss', 'value_loss', 'entropy'):
-        eval_results["stats"].setdefault(k, algorithm.last_metrics.get(k, 0.0))
+    eval_results = algorithm.evaluate()   # the task's own dict, passed through untouched
 
     return {
         "results": eval_results,
@@ -113,7 +112,8 @@ def run_one(
     overrides: Mapping[str, Any],
     *,
     config_cls: Type,
-    run_experiment: Callable[[RunContext, Any], Optional[Mapping[str, Any]]],
+    build_env: Callable,
+    build_algorithm: Callable,
 ) -> None:
     """Build the config + RunContext for one run and execute it (the bundle lifecycle).
 
@@ -121,7 +121,7 @@ def run_one(
     them silently meant a stale or misspelled ``--set`` ran the default arm under the name
     of the one you asked for, which is invisible in the results.
     Run-bundle metadata comes from the config's duck-typed ``family()`` /
-    ``signature()`` / ``logging_config()`` methods.
+    ``signature()`` / ``logging_config()`` / ``describe()`` methods.
     """
     valid = {f.name for f in fields(config_cls) if f.init}
     # Optional per-dataset preset applied UNDER the CLI overrides (so --set always wins).
@@ -146,9 +146,19 @@ def run_one(
     try:
         ctx.log_event("run_started")
         with ctx.stdout_capture():
-            result = run_experiment(ctx, cfg)
+            t0 = time.time()
+            cfg._run_root = str(ctx.root)   # the bundle root, for builders and callbacks
+            describe = getattr(cfg, "describe", None)
+            logger.info("Run output: %s%s", ctx.root, f" | {describe()}" if callable(describe) else "")
+            details = run(cfg, build_env=build_env, build_algorithm=build_algorithm)
+            results = scalars(details["results"])
+            train = scalars(getattr(details["algorithm"], "last_metrics", None) or {})
+            for split, metrics in (("train", train), ("test", results)):
+                if metrics:
+                    ctx.log_metrics(metrics, step=cfg.total_timesteps, split=split)
+            result = dict(results, wall_s=round(time.time() - t0, 1))
         ctx.log_event("run_completed")
-        ctx.finish(status="completed", final_metrics=dict(result) if result else {})
+        ctx.finish(status="completed", final_metrics=result)
     except Exception as exc:
         ctx.log_event("run_failed", error=str(exc))
         ctx.finish(
@@ -162,7 +172,8 @@ def run_one(
 def run_cli(
     *,
     config_cls: Type,
-    run_experiment: Callable[[RunContext, Any], Optional[Mapping[str, Any]]],
+    build_env: Callable,
+    build_algorithm: Callable,
     description: str = "",
     extras_handler: Optional[Callable[[argparse.Namespace, dict], None]] = None,
     grid_exclude: Iterable[str] = ("seed",),
@@ -219,4 +230,5 @@ def run_cli(
                 run_overrides["seed"] = seed
                 if has_seed_run_i:
                     run_overrides["seed_run_i"] = seed
-            run_one(run_overrides, config_cls=config_cls, run_experiment=run_experiment)
+            run_one(run_overrides, config_cls=config_cls,
+                    build_env=build_env, build_algorithm=build_algorithm)

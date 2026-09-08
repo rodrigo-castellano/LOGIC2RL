@@ -5,6 +5,7 @@
 
 import os
 import random
+from typing import Any, Dict, Mapping
 
 import numpy as np
 import torch
@@ -58,4 +59,12 @@ def seed_all(
             torch.backends.cudnn.benchmark = True  # cuDNN autotuner
 
 
-__all__ = ['seed_all']
+def scalars(metrics: Mapping[str, Any]) -> Dict[str, Any]:
+    """The loggable entries of a metrics dict: str / int / float / bool, nothing else.
+
+    An evaluator may return tensors or nested config alongside its numbers; those belong in
+    the run's artifacts, never in ``metrics.json`` or a manifest."""
+    return {k: v for k, v in metrics.items() if isinstance(v, (str, int, float, bool))}
+
+
+__all__ = ['scalars', 'seed_all']
