@@ -15,11 +15,11 @@ picks the branch. The engine therefore exposes the two Prolog verbs that remain:
   derive     the SLD successor function — ONE backward resolution step from each goal state:
              select the leftmost atom → resolve against facts ∥ rule heads → pack the
              children densely → prune subgoals that are known facts → standardize variables.
-             Open vars are committed separately by ``replace_candidates`` (dispatching on
-             ``var_fill`` to ``soft_fill_vars`` — the joint-scorer argmax over all entities —
-             or ``SLD.fact_fill_vars`` — the argmax over REAL-FACT fillers, no-fact states
-             discarded) — invoked ONCE per final candidate set by the env's candidate
-             generation, at the end of ``UnificationLogic``'s candidate pipeline, so delivered
+             Open vars are committed separately by ``replace_candidates`` (delegating to the
+             app's ``candidate_filler`` — e.g. the KGE joint's beam discard, or its top-s soft
+             fill that expands an open state into s ground children) — invoked ONCE per final
+             candidate set by the env's candidate generation, at the end of
+             ``UnificationLogic``'s candidate pipeline, so delivered
              candidates leave ground.
   prove      ≈ solve/1 — reference exhaustive breadth-first search over ``derive``
              (tests/debugging only; the RL path never calls it).
@@ -119,11 +119,11 @@ class BaseEngine(nn.Module):
         self.num_rules = self.kb.rule_index.num_rules
         self.max_children = self.kb.max_children
 
-        # The replace_candidates seam: an OPTIONAL app-attached filler ``(states, counts) ->
-        # states`` that commits open vars (e.g. the KGE joint's soft/hard fill). None = pure
-        # resolution (vars pass through untouched). The fill semantics — argmax choice,
-        # real-fact restriction, no-filler discard — live ENTIRELY in the app's filler; the
-        # engine only delegates.
+        # The replace_candidates seam: an OPTIONAL app-attached filler ``(states, counts,
+        # rule_idx) -> (states, counts, rule_idx)`` that commits, discards or expands open-var
+        # states (e.g. the KGE joint's beam discard or top-s soft fill). None = pure resolution
+        # (vars pass through untouched). The fill semantics live ENTIRELY in the app's filler;
+        # the engine only delegates.
         self.candidate_filler = None
         # Opt-in per-env [B, L, W] proven-body scratch: when the app attaches a static
         # buffer here, each ``derive`` stashes the env's FIRST fully-ground body (every atom
@@ -168,26 +168,28 @@ class BaseEngine(nn.Module):
         fresh-runtime-var allocator, advanced and returned; atoms are FLAT ``(pred, arg1, …)``."""
         raise NotImplementedError("derive: use a concrete engine (SLD / Enumerate), not BaseEngine.")
 
-    def replace_candidates(self, states: Tensor, counts: Tensor) -> Tensor:
+    def replace_candidates(self, states: Tensor, counts: Tensor, rule_idx: Tensor,
+                           excluded: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
         """The post-derive candidate-fill seam — delegate to the app-attached
-        ``candidate_filler`` (``(states, counts) -> states``; e.g. the KGE joint's soft or
-        hard fill), or pass the states through untouched when none is attached. Invoked ONCE
-        per final candidate set by the env's candidate generation (the end of
-        ``UnificationLogic``'s pipeline, after the unary refine). For SLD the filler sees ALL
-        the free vars; for :class:`Enumerate` only the RESIDUAL its real-fact resolution
-        left open.
+        ``candidate_filler`` (``(states [B, G, A, W], counts [B], rule_idx [B, G],
+        excluded [B, 1, W] | None) -> the (states, counts, rule_idx) triple``; e.g. the KGE
+        joint's beam discard or top-s soft fill), or pass the candidates through untouched
+        when none is attached. ``excluded`` is the episode's root query atom, the same one
+        ``derive`` gets: a filler that consults the facts must not read it as one. Invoked ONCE per final candidate
+        set by the env's candidate generation (the end of ``UnificationLogic``'s pipeline,
+        after the unary refine and the stop-action appends). For SLD the filler sees ALL the
+        free vars; for :class:`Enumerate` only the RESIDUAL its real-fact resolution left open.
 
-        This seam is SHAPE-PRESERVING by construction (proof-marking, pruning, and compaction
-        all run before it): a filler fills existing slots, never expands the set. Expansion
-        (one state → many groundings) is a resolution-level operation and lives inside
-        ``derive`` — see :class:`Enumerate`'s ``enumerate_groundings``. A filler's [S,E] GEMM
-        lives at this seam — NOT inside ``derive`` — on purpose: the unary auto-advance
-        re-derives up to ``max_unary_iterations`` times per env step, so running it in
-        ``derive`` pays it on every intermediate candidate set (~2.4x slower — measured);
-        here it runs exactly once."""
+        A filler may fill slots in place, discard them, or EXPAND one open state into several
+        ground children — APPENDED after the existing slots, so every slot index stashed
+        upstream (the stop actions') stays valid — advancing ``counts`` and ``rule_idx`` in
+        lock-step. A filler's [S,E] GEMM lives at this seam — NOT inside ``derive`` — on
+        purpose: the unary auto-advance re-derives up to ``max_unary_iterations`` times per
+        env step, so running it in ``derive`` pays it on every intermediate candidate set
+        (~2.4x slower — measured); here it runs exactly once."""
         if self.candidate_filler is None:
-            return states
-        return self.candidate_filler(states, counts)
+            return states, counts, rule_idx
+        return self.candidate_filler(states, counts, rule_idx, excluded)
 
     def _stash_proven_body(self, derived: Tensor, keep: Tensor, counts: Tensor) -> None:
         """Stash each env's FIRST fully-ground body — every atom a real fact (all pruned by

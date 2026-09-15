@@ -2,7 +2,8 @@
 
 Three packages: ``base/`` is the shared substrate (``BaseEngine``: consult ≈ Prolog
 ``consult``, ``derive`` = one backward step the RL env drives, ``replace_candidates`` = the
-shape-preserving seam that delegates open-var filling to an app-attached ``candidate_filler``,
+seam that delegates open-var filling (in place, or expanded into appended ground children) to
+an app-attached ``candidate_filler``,
 ``prove`` = the reference solver; plus ``kb`` / ``resolution``). ``sld/`` and ``enumerate/`` are
 the two concrete engines — siblings that both extend ``BaseEngine`` and differ only in
 ``derive``: SLD resolves facts ∥ rules (open vars persist until the seam filler — or forever,

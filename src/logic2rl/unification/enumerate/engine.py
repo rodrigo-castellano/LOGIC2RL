@@ -12,8 +12,7 @@ without one they die. Configure the enumerate width ``K``, the compaction width 
 ``enumerate_groundings`` is a standalone, reusable function (the fact-side joint): any engine
 that has rule bodies with ≤1 shared free var over ≤2 soft atoms can enumerate their real-fact
 groundings with it — a RESOLUTION-level primitive (it expands one state into many grounded
-children, so it belongs inside ``derive``; the shape-preserving ``replace_candidates`` seam
-cannot host an expansion).
+children, so it belongs inside ``derive``, next to the resolution that creates the vars).
 """
 from __future__ import annotations
 
