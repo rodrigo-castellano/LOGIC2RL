@@ -228,7 +228,7 @@ class FuncEnv:
 
         active, new_current, new_depths = self._apply_action(state, actions)
         truncated, is_success, is_end, step_done = self._terminal(state, new_current, new_depths, active)
-        rewards = self._reward(state, step_done, is_success, active)
+        rewards = self._reward(state, step_done, is_success, active, actions)
 
         # Cumulative bookkeeping: edge-done this step, done-by-now, success-by-now, still-active.
         newly_done = active & step_done
@@ -300,13 +300,15 @@ class FuncEnv:
         step_done = terminated | truncated
         return truncated, is_success, is_end, step_done
 
-    def _reward(self, state: EnvState, step_done: Tensor, is_success: Tensor, active: Tensor) -> Tensor:
+    def _reward(self, state: EnvState, step_done: Tensor, is_success: Tensor, active: Tensor,
+                actions: Optional[Tensor] = None) -> Tensor:
         """Transition reward for the active envs (zero for already-done envs).
 
         Base: +1 for a successful terminal transition, else 0 — no positive/negative
         distinction (a base task such as MNIST-addition has no such concept; ``state`` is
         unused). The task override seam: ``KGEFuncEnv._reward`` scores negative-labeled
-        queries with the 4-way reward, reading the per-query label off ``state``.
+        queries with the 4-way reward, reading the per-query label off ``state``; ``actions`` (the
+        slot each env took) lets it tell an appended claim from the engine's own verdict.
         """
         return torch.where(active & step_done & is_success, self._reward_pos, self._reward_zero)
 
