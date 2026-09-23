@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from stable_baselines3.common.distributions import CategoricalDistribution
+from logic2rl.algorithm.policy.distribution import CategoricalDistribution
 from tensordict import TensorDict
 
 from .base import BasePolicy

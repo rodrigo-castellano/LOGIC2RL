@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
-from stable_baselines3.common.distributions import CategoricalDistribution
+from logic2rl.algorithm.policy.distribution import CategoricalDistribution
 from torch import Tensor, nn
 
 

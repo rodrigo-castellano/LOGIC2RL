@@ -8,7 +8,7 @@ embedder that composes them (``embeddings.EmbedderLearnable``). Imports nothing 
 ``kge.nn`` (``kge.nn.embeddings.EmbedderLearnable`` subclasses the composer here).
 
 (Masked categorical action distributions are a policy concern and live with the
-algorithm at ``algorithm/policy/`` — both policies use SB3 ``CategoricalDistribution``.)
+algorithm at ``algorithm/policy/`` — both policies use ``algorithm.policy.distribution.CategoricalDistribution``.)
 """
 from .atom_embedders import Emb_Atom_Factory
 from .embeddings import ConstantEmbeddings, EmbedderLearnable, PredicateEmbeddings
