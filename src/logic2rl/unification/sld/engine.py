@@ -59,8 +59,27 @@ def resolve_facts(
     return fact_goals, success
 
 
+def resolve_ground_fact(queries: Tensor, remaining: Tensor, fact_index, pad: int, active: Tensor,
+                        excluded: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    """Fact resolution of GROUND goals: a ground goal unifies with the one fact equal to it, with
+    no bindings, so its child is the remaining goals. ``(fact_goals [B, 1, L, W], success [B, 1])``,
+    the root query ``excluded`` never a match. ``resolve_facts`` finds the same fact, when it lies
+    within the first ``K_f`` of its (pred, arg) group."""
+    success = fact_index.exists(queries) & active
+    if excluded is not None:
+        success = success & ~(queries == excluded[:, 0, :]).all(-1)
+    goals = torch.where(success.view(-1, 1, 1), remaining, torch.full_like(remaining, pad))
+    return goals.unsqueeze(1), success.unsqueeze(1)
+
+
 class SLD(BaseEngine):
-    """SLD backward resolution — see the module docstring."""
+    """SLD backward resolution — see the module docstring. ``ground_goals`` declares that every
+    goal is ground (a filler commits each open child at the seam, so no state keeps a variable):
+    the fact step is then a membership test, and the pack is K_r + 1 wide."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.G = min(self.G, (1 if self.ground_goals else self.kb.K_f) + self.kb.K_r)   # no more than a step emits
 
     @torch.no_grad()
     def derive(self, current_states: Tensor, next_var_indices: Tensor,
@@ -86,9 +105,13 @@ class SLD(BaseEngine):
         remaining[:, 0, :] = pad
 
         # ── RESOLVE: facts ∥ rules (dense) ──
-        fact_goals, fact_success = resolve_facts(
-            queries, remaining, kb.fact_index, kb.constant_no, pad, kb.K_f,
-            active, excluded=excluded_queries)
+        if self.ground_goals:
+            fact_goals, fact_success = resolve_ground_fact(
+                queries, remaining, kb.fact_index, pad, active, excluded=excluded_queries)
+        else:
+            fact_goals, fact_success = resolve_facts(
+                queries, remaining, kb.fact_index, kb.constant_no, pad, kb.K_f,
+                active, excluded=excluded_queries)
         rule_goals, rule_success, sub_rule_idx = resolve_rules(
             queries, remaining, kb.rule_index, kb.constant_no, pad, kb.K_r,
             active, next_var_indices)
@@ -118,4 +141,4 @@ class SLD(BaseEngine):
         return derived, counts, new_next_var, rule_idx
 
 
-__all__ = ["SLD", "resolve_facts"]
+__all__ = ["SLD", "resolve_facts", "resolve_ground_fact"]

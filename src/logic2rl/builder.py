@@ -119,9 +119,13 @@ def build_env(
     # The engine owns the runtime-var id-space: it self-computes start/end and the packing
     # base from constant_no + the static pool size (config.max_total_vars), and the
     # branching-derived embedder n_vars once max_children is known.
+    from logic2rl.unification import SLD, Enumerate
     if engine_cls is None:
-        from logic2rl.unification import SLD, Enumerate
         engine_cls = Enumerate if getattr(config, "resolution", "sld") == "enumerate" else SLD
+    # A committing fill (soft / hard) leaves no state with a variable, so SLD resolves only ground
+    # goals: one fact child at most, and the action width is the rules' fan-out.
+    ground = {"ground_goals": True} if (issubclass(engine_cls, SLD) and
+                                         getattr(config, "replace_candidates", None) in ("soft", "hard")) else {}
     vec_engine = engine_cls(
         facts_idx=mat.facts_idx,
         rules_idx=mat.rules_idx,
@@ -135,6 +139,7 @@ def build_env(
         device=device,
         padding_atoms=config.padding_atoms,
         max_children=config.padding_states,
+        **ground,
         **dict(config.engine_extra_kwargs),
     )
     if config.padding_states is None:

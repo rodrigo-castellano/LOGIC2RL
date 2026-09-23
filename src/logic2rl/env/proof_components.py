@@ -44,10 +44,7 @@ class UnaryAdvanceComponent(EnvComponent):
         if not self.skip_unary_actions:
             return cand
         bsz, dev = env.batch_size, env.device
-        # The episode's root query (cycle-prevention exclusion): the carried original_queries
-        # at a step; at reset (state is None) the bundle's current state IS the root query.
-        original_queries = state.original_queries if state is not None else cand.current_states
-        excluded = original_queries[:, 0:1, :]
+        excluded = cand.roots[:, 0:1, :]                       # the episode's query (cycle exclusion)
         cur, derived, counts, var = cand.current_states, cand.derived, cand.counts, cand.next_var
         rule_idx, fields = cand.derived_rule_idx, dict(cand.fields)
         hh, hc = fields.get("history_hashes"), fields.get("history_count")

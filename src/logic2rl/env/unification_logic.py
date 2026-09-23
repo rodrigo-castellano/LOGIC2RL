@@ -35,13 +35,13 @@ class _Cand(NamedTuple):
     next_var: Tensor                # [B]
     derived_rule_idx: Tensor        # [B, G] which top-level rule produced each candidate (0 = padding)
     fields: dict                    # component state-field updates (e.g. history_hashes/count)
+    roots: Tensor                   # [B, A, W]  each lane's episode query (never re-derived)
 
 
 class UnificationLogic:
     """Derived-state construction: ``_derive_step`` (raw derive → keep-mask → compact) is the
-    single pipeline primitive; ``_compute_derived`` / ``_compute_initial`` wrap it with the
-    step / reset field handling and run the component ``candidate_refine`` seam (where the
-    unary advance and the stop-action appends live)."""
+    single pipeline primitive; ``_compute`` wraps it with the component ``candidate_refine`` seam
+    (where the unary advance and the stop-action appends live) and the engine's fill."""
 
     def __init__(self, env: Any) -> None:
         self.env = env
@@ -59,49 +59,23 @@ class UnificationLogic:
         # Compaction scratch (cudagraph-stable address), owned by the compaction below.
         self._compact_scratch = torch.zeros(env.batch_size, G, A * W, dtype=torch.long, device=env.device)
 
-    def _compute_derived(self, new_current: Tensor, state) -> "_Cand":
-        """Candidate next-states for the post-action ``new_current`` (the step path).
-
-        Components update their working fields (``step_update_fields`` — e.g. memory appends
-        the current hash) → ``_derive_step`` → components refine (``candidate_refine`` — e.g.
-        unary auto-advance, stop-action appends), in component order.
-        """
+    def _compute(self, current: Tensor, next_var: Tensor, fields: Dict[str, Tensor], roots: Tensor,
+                 state) -> "_Cand":
+        """Candidate next-states of ``current`` [B, A, W]: ``_derive_step`` → the components'
+        ``candidate_refine`` (e.g. the unary advance, the stop appends), in component order → the
+        engine's fill seam. ``fields`` is the components' working state (a step's, updated by
+        ``step_update_fields``, or a reset's, seeded by ``reset_seed_fields``: one pass serves
+        both, lane by lane), ``roots`` each lane's episode query (the cycle exclusion) and
+        ``state`` the pre-step state (``None`` at a reset)."""
         env = self.env
-        active = ~state.done.bool()
-        fields = {k: getattr(state, k) for k in env._component_fields}
-        for c in env.components:
-            fields.update(c.step_update_fields(env, new_current, fields, active))
-        derived, counts, new_var, rule_idx = self._derive_step(
-            new_current, state.next_var_indices, fields, state,
-            excluded=state.original_queries[:, 0:1, :])
-        cand = _Cand(current_states=new_current, derived=derived, counts=counts, next_var=new_var,
-                     derived_rule_idx=rule_idx, fields=fields)
+        excluded = roots[:, 0:1, :]
+        derived, counts, new_var, rule_idx = self._derive_step(current, next_var, fields, state, excluded=excluded)
+        cand = _Cand(current_states=current, derived=derived, counts=counts, next_var=new_var,
+                     derived_rule_idx=rule_idx, fields=fields, roots=roots)
         for c in env.components:
             cand = c.candidate_refine(env, cand, state)
         derived, counts, rule_idx = env.engine.replace_candidates(
-            cand.derived, cand.counts, cand.derived_rule_idx,
-            excluded=state.original_queries[:, 0:1, :])
-        return cand._replace(derived=derived, counts=counts, derived_rule_idx=rule_idx)
-
-    def _compute_initial(self, queries: Tensor) -> "_Cand":
-        """Candidate generation for a freshly-reset env — the reset twin of
-        ``_compute_derived``: components seed their fields (``reset_seed_fields`` — e.g. memory
-        seeds the visit-history), then the same ``_derive_step`` → ``candidate_refine`` flow
-        (``state=None`` marks the reset context)."""
-        env = self.env
-        fields: Dict[str, Tensor] = {}
-        for c in env.components:
-            fields.update(c.reset_seed_fields(env, queries))
-        var_idx = torch.full((queries.shape[0],), env.runtime_var_start_index,
-                             dtype=torch.long, device=env.device)
-        derived, counts, new_var, rule_idx = self._derive_step(
-            queries, var_idx, fields, None, excluded=queries[:, 0:1, :])
-        cand = _Cand(current_states=queries, derived=derived, counts=counts, next_var=new_var,
-                     derived_rule_idx=rule_idx, fields=fields)
-        for c in env.components:
-            cand = c.candidate_refine(env, cand, None)
-        derived, counts, rule_idx = env.engine.replace_candidates(
-            cand.derived, cand.counts, cand.derived_rule_idx, excluded=queries[:, 0:1, :])
+            cand.derived, cand.counts, cand.derived_rule_idx, excluded=excluded)
         return cand._replace(derived=derived, counts=counts, derived_rule_idx=rule_idx)
 
     def _derive_step(self, current_states: Tensor, next_var_indices: Tensor,
@@ -110,8 +84,8 @@ class UnificationLogic:
         """One full candidate-gen step from ``current_states`` → compacted candidates (static
         shapes): ``_derive_raw`` (engine step + shape) → keep-mask (validity AND every
         component's ``candidate_keep_mask``, e.g. memory not-visited) → ``_finalize`` (compact
-        + FALSE fallback). The pipeline primitive shared by ``_compute_derived`` /
-        ``_compute_initial`` and the unary advance's re-derive. ``fields`` carries the component
+        + FALSE fallback). The pipeline primitive shared by ``_compute`` and the unary
+        advance's re-derive. ``fields`` carries the component
         working state (e.g. the updated visit-history) the keep-masks read. Returns
         ``(derived, counts, next_var, rule_idx)``."""
         env = self.env

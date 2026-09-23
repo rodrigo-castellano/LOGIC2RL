@@ -86,6 +86,7 @@ class BaseEngine(nn.Module):
         derived_cap: Optional[int] = None,    # G: output slots per derive (default 256)
         full_fact_slots: bool = False,        # facts get the full budget (SB3 enumeration width)
         n_vars: Optional[int] = None,         # runtime-var table size (default: derived formula)
+        ground_goals: bool = False,           # every goal is ground (a committing filler): see SLD
     ):
         super().__init__()
         assert facts_idx.shape[-1] == rules_idx.shape[-1], (
@@ -117,7 +118,9 @@ class BaseEngine(nn.Module):
             max_children=550 if max_children is None else int(max_children),
             full_fact_slots=full_fact_slots)
         self.num_rules = self.kb.rule_index.num_rules
-        self.max_children = self.kb.max_children
+        # A ground goal is a fact or not: one fact child at most beside its rule children.
+        self.ground_goals = bool(ground_goals)
+        self.max_children = self.kb.K_r + 1 if self.ground_goals else self.kb.max_children
 
         # The replace_candidates seam: an OPTIONAL app-attached filler ``(states, counts,
         # rule_idx) -> (states, counts, rule_idx)`` that commits, discards or expands open-var

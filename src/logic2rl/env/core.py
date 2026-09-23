@@ -10,7 +10,7 @@ isn't here), and KGE specialization is a subclass (``KGEFuncEnv``) so the facade
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -26,6 +26,11 @@ if TYPE_CHECKING:
     from logic2rl.data_loader import MaterializedData
 
 Tensor = torch.Tensor
+
+
+def _lanes(mask: Tensor, a: Tensor, b: Tensor) -> Tensor:
+    """``a`` on the lanes of ``mask`` [B], ``b`` elsewhere, for fields of any rank."""
+    return torch.where(mask.view(-1, *[1] * (a.dim() - 1)), a, b)
 
 
 class EnvState(NamedTuple):
@@ -215,16 +220,23 @@ class FuncEnv:
     # STEP (stateless; the compiled rollout calls these directly)
     # =========================================================================
 
-    def step_core(self, state: EnvState, actions: Tensor) -> Tuple[EnvState, "StepOutput"]:
-        """Bare stateless step: each env steps into its chosen candidate → (next_state, step_output).
+    def step_core(self, state: EnvState, actions: Tensor,
+                  restart: Optional[Callable[[Tensor], Tuple[Tensor, Tensor, Tensor, dict]]] = None
+                  ) -> Tuple[EnvState, "StepOutput"]:
+        """Each env steps into its chosen candidate → (next_state, step_output).
 
         Applies the action, scores the transition + terminal outcome, regenerates candidates
         (the grounder), freezes done envs, and emits the per-transition ``StepOutput`` beside the
-        recurrent next ``EnvState``. **No auto-reset** — used by eval / scoring (done envs stay
-        done). The training rollout + gym facade use ``step_autoreset``.
+        recurrent next ``EnvState``. ``restart(done) -> (mask, queries [B, W], per_env_ptrs, extra)``
+        names the lanes that begin a new episode this step, given the ones that just finished:
+        they are derived in the SAME candidate pass as the stepping lanes (one derive and one fill
+        per step, not a second pass over every lane), and their next state is exactly
+        ``reset_core``'s. Without it done envs stay done (eval / scoring); ``step_autoreset`` is
+        the training one. ``step_output`` describes the completed step whatever restarted.
         """
         assert actions.dim() == 1 and actions.shape[0] == self.batch_size, \
             f"actions must be [B={self.batch_size}], got shape {actions.shape}"
+        B = self.batch_size
 
         active, new_current, new_depths = self._apply_action(state, actions)
         truncated, is_success, is_end, step_done = self._terminal(state, new_current, new_depths, active)
@@ -236,12 +248,37 @@ class FuncEnv:
         new_success = state.success.bool() | (active & is_success)
         still_active = ~new_done
 
-        cand = self._derive(state, new_current, new_depths, still_active)
+        # The candidate pass: the stepping lanes from new_current, the restarting ones from their
+        # fresh query, lane by lane (a done, not restarted lane is derived and then frozen).
+        fields = {k: getattr(state, k) for k in self._component_fields}
+        for c in self.components:
+            fields.update(c.step_update_fields(self, new_current, fields, active))
+        roots, cur, var, ptrs = state.original_queries, new_current, state.next_var_indices, state.per_env_ptrs
+        if restart is not None:
+            rs, queries, ptrs, extra = restart(newly_done)
+            fresh = self._as_state(queries)
+            roots, cur = (torch.where(rs.view(B, 1, 1), fresh, t) for t in (roots, cur))
+            var = torch.where(rs, self.runtime_var_start_index, var)
+            seeded = {k: v for c in self.components for k, v in c.reset_seed_fields(self, fresh).items()}
+            fields.update({k: _lanes(rs, v, fields[k]) for k, v in seeded.items()})
+            live = still_active | rs
+        else:
+            live = still_active
+        cand = self.unification_logic._compute(cur, var, fields, roots, state)
+        cand = cand._replace(
+            derived=torch.where(live.view(B, 1, 1, 1), cand.derived, state.derived_states),
+            counts=torch.where(live, cand.counts, state.derived_counts),
+            next_var=torch.where(live, cand.next_var, state.next_var_indices),
+        )
+        for c in self.components:   # a restarted lane is not still_active: no step transform
+            cand = c.step_transform_candidates(self, cand, state, new_depths, still_active)
 
-        # Assemble the recurrent next state (+ component-owned field updates via step_commit_fields).
+        # The stepped state (+ component-owned field updates via step_commit_fields). A restarted
+        # lane's current state is the one it stepped into: its candidates are its new episode's.
+        stepped = cand.current_states if restart is None else torch.where(rs.view(B, 1, 1), new_current, cand.current_states)
         updates = dict(
-            current_states=cand.current_states, derived_states=cand.derived, derived_counts=cand.counts,
-            next_var_indices=cand.next_var, depths=new_depths,
+            current_states=stepped, derived_states=cand.derived, derived_counts=cand.counts,
+            next_var_indices=cand.next_var, depths=new_depths, per_env_ptrs=ptrs,
             done=new_done.to(torch.uint8), success=new_success.to(torch.uint8),
         )
         updates.update(cand.fields)   # component-owned fields seeded during candidate-gen (e.g. memory)
@@ -249,21 +286,24 @@ class FuncEnv:
             updates.update(c.step_commit_fields(self, cand, state, still_active))
         new_state = state._replace(**updates)
 
-        # Per-transition snapshot (survives the same-step auto-reset): canonical gym returns + base
-        # info fields + every component's trace fields. final_observation = the terminal current
-        # state (= obs sub_index), read by the truncation bootstrap / surfaced as final_obs.
+        # Per-transition snapshot of the completed step: canonical gym returns + base info fields +
+        # every component's trace fields. final_observation = the terminal current state (= obs
+        # sub_index), read by the truncation bootstrap / surfaced as final_obs.
         trace = dict(
             step_rewards=rewards,
             step_dones=newly_done.to(torch.uint8),
             step_truncated=(active & truncated).to(torch.uint8),
             is_success=new_success.to(torch.uint8),
             original_queries=state.original_queries,
-            final_observation=cand.current_states,
+            final_observation=stepped,
         )
         ctx = TransitionCtx(actions=actions, active=active, newly_done=newly_done,
                             truncated=truncated, is_success=is_success, is_end=is_end)
         for c in self.components:
             trace.update(c.step_trace(self, state, new_state, ctx))
+        if restart is not None:
+            ini = self._initial(cand, roots, ptrs, extra, seeded)
+            new_state = type(new_state)(**{f: _lanes(rs, ini[f], getattr(new_state, f)) for f in new_state._fields})
         return new_state, self.StepOutput(**trace)
 
     def _apply_action(self, state: EnvState, actions: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -312,52 +352,20 @@ class FuncEnv:
         """
         return torch.where(active & step_done & is_success, self._reward_pos, self._reward_zero)
 
-    def _derive(self, state: EnvState, new_current: Tensor, new_depths: Tensor,
-                still_active: Tensor) -> Any:
-        """Regenerate the candidate next-states for the new current state.
-
-        Candidate-gen (visit-history update + unification + skip-unary advance) is delegated to
-        the ``unification_logic`` component; done envs are frozen on their previous derived set,
-        then components may transform the candidates (e.g. terminal-actions force {true,false} at
-        max depth). No-op transform when no component owns one.
-        """
-        B = self.batch_size
-        cand = self.unification_logic._compute_derived(new_current, state)
-        cand = cand._replace(
-            derived=torch.where(still_active.view(B, 1, 1, 1), cand.derived, state.derived_states),
-            counts=torch.where(still_active, cand.counts, state.derived_counts),
-            next_var=torch.where(still_active, cand.next_var, state.next_var_indices),
-        )
-        for c in self.components:
-            cand = c.step_transform_candidates(self, cand, state, new_depths, still_active)
-        return cand
-
     def step_autoreset(self, state: EnvState, actions: Tensor) -> Tuple[EnvState, "StepOutput"]:
         """Stateless step + same-step auto-reset of the finished envs → (next_state, step_output).
 
-        The training / gym-facade step: runs ``step_core``, then re-initializes the envs that
-        finished this step. The reset draw reads the PRE-step context (the cursor + the kge
-        corruption counters the step itself advances); its fresh initial state is spliced into the
-        post-step state — finished envs take the reset, active envs keep theirs. The splice is
-        generic over the fields, so subclass fields (kge per-query / counters) ride along;
-        ``step_output`` is the completed step's output (it survives the recurrent-state splice).
+        The training / gym-facade step: ``step_core`` with every finished env restarting from the
+        pool. The draw reads the PRE-step context (the cursor + the kge corruption counters the
+        step itself advances) and happens before the candidate pass, which derives the restarted
+        envs with the stepping ones; ``step_output`` is the completed step's output.
         """
-        next_state, step_output = self.step_core(state, actions)
-        done_mask = step_output.step_dones.bool()
-        # Draw fresh queries for the finished envs (round-robin + component corruption) and build
-        # their initial state. The draw gets only the context fields it reads (the kge corruption
-        # counters), not the whole state. reset_core takes the advanced cursor.
         context = {f: getattr(state, f) for f in self._component_fields}
-        queries, new_ptrs, extra = self.draw_queries(self.query_pool, state.per_env_ptrs, done_mask, context=context)
-        reset_state = self.reset_core(queries, per_env_ptrs=new_ptrs, **extra)
-        spliced = {}
-        for field in type(next_state)._fields:
-            r_val, n_val = getattr(reset_state, field), getattr(next_state, field)
-            m = done_mask
-            for _ in range(r_val.ndim - 1):
-                m = m.unsqueeze(-1)
-            spliced[field] = torch.where(m, r_val, n_val)
-        return type(next_state)(**spliced), step_output
+
+        def restart(done: Tensor):
+            queries, new_ptrs, extra = self.draw_queries(self.query_pool, state.per_env_ptrs, done, context=context)
+            return done, queries, new_ptrs, extra
+        return self.step_core(state, actions, restart=restart)
 
     # =========================================================================
     # RESET (stateless)
@@ -371,39 +379,43 @@ class FuncEnv:
         component state from the candidate bundle + the draw context ``extra`` (e.g. the kge
         per-query fields / counters). Returns the state; project to obs via ``observation(state)``.
         """
-        device = self.device
-        A, pad = self.padding_atoms, self.padding_idx
         B = queries.shape[0]
         assert B == self.batch_size, f"reset expects queries for all {self.batch_size} envs, got {B}."
+        roots = self._as_state(queries)
+        seeded = {k: v for c in self.components for k, v in c.reset_seed_fields(self, roots).items()}
+        var = torch.full((B,), self.runtime_var_start_index, dtype=torch.long, device=self.device)
+        cand = self.unification_logic._compute(roots, var, seeded, roots, None)
+        ptrs = per_env_ptrs if per_env_ptrs is not None else torch.zeros(B, dtype=torch.long, device=self.device)
+        ini = self._initial(cand._replace(derived=cand.derived.clone()), roots, ptrs, extra, seeded)
+        return self.State(**{f: ini[f] for f in self.State._fields})
 
-        W = self.atom_width
-        padded = torch.full((B, A, W), pad, dtype=torch.long, device=device)
-        padded[:, 0, :] = queries.to(device)  # [B, W] → first atom slot
-        queries = padded  # [B, A, W]
+    def _as_state(self, queries: Tensor) -> Tensor:
+        """``[B, W]`` query atoms → ``[B, A, W]`` one-atom states."""
+        B, A, W = queries.shape[0], self.padding_atoms, self.atom_width
+        padded = torch.full((B, A, W), self.padding_idx, dtype=torch.long, device=self.device)
+        padded[:, 0, :] = queries.to(self.device)
+        return padded
 
-        cand = self.unification_logic._compute_initial(queries)
-
-        zeros_long = torch.zeros(B, dtype=torch.long, device=device)
+    def _initial(self, cand, roots: Tensor, per_env_ptrs: Tensor, extra: dict,
+                 seeded: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """A new episode's state fields from its candidate bundle: the core fields, the fields the
+        components seeded before the derive (``seeded``, as the pass left them in ``cand.fields``),
+        then ``reset_commit_fields`` from the draw context ``extra``, then each declared field's
+        ``FieldSpec.init`` default for any still unset."""
+        B = roots.shape[0]
+        zeros = torch.zeros(B, dtype=torch.long, device=self.device)
         core = dict(
-            current_states=cand.current_states,
-            derived_states=cand.derived.clone(),
-            derived_counts=cand.counts,
-            original_queries=queries,
-            next_var_indices=cand.next_var,
-            depths=zeros_long,
-            done=torch.zeros(B, dtype=torch.uint8, device=device),
-            success=torch.zeros(B, dtype=torch.uint8, device=device),
-            per_env_ptrs=per_env_ptrs if per_env_ptrs is not None else zeros_long,
+            current_states=cand.current_states, derived_states=cand.derived, derived_counts=cand.counts,
+            original_queries=roots, next_var_indices=cand.next_var, depths=zeros,
+            done=zeros.to(torch.uint8), success=zeros.to(torch.uint8), per_env_ptrs=per_env_ptrs,
         )
-        core.update(cand.fields)   # component-owned fields seeded during candidate-gen (e.g. memory)
+        core.update({k: cand.fields[k] for k in seeded})
         for c in self.components:
             core.update(c.reset_commit_fields(self, core, cand, extra))
-        # Safety net: any declared component field a component didn't seed above falls back to its
-        # FieldSpec.init default — so a component can declare a state field without hand-seeding it.
         for name, init in self._field_init.items():
             if name not in core:
                 core[name] = init(self, B)
-        return self.State(**core)
+        return core
 
     def reset_pool(self, prev_state: "Optional[EnvState]" = None) -> EnvState:
         """Reset ALL envs from the active query pool → the initial bootstrap state.
