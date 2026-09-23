@@ -8,6 +8,8 @@ debugging). Evaluation compiles where it runs (see the evaluators).
     _setup             hyperparams → policy → buffers (schema by example) → optimizer → _compile
     rollout_step       compiled: sample + env.step_autoreset
     _loss_step         compiled: PPOLossModule over the buffer's static batch tensors
+    _update            one minibatch update on device, captured once as a CUDA graph and
+                       replayed for every minibatch of every epoch (``_train_graphed``)
     _warmup_gradients  pre-allocate .grad storage (stable addresses for cudagraphs)
     _warmup_rollout    one-off compile of the rollout, RNG-guarded (SB3 parity)
     collect_rollouts   the rollout loop (prepare → step → bootstrap → buffer → stats)
@@ -163,10 +165,13 @@ class PPO(BaseAlgorithm):
                           if field is None or field in self.env.StepOutput._fields}
         self._stat_bufs = {name: torch.zeros(T, B, device=device) for name in self._stat_fns}
 
+        # A graphed update steps the optimizer inside a CUDA graph: its state and lr live on device.
+        graphed = self._graphable()
         self.optimizer = torch.optim.AdamW(
-            self.policy.parameters(), lr=self.learning_rate, eps=1e-5,
-            weight_decay=self.weight_decay, fused=self.device.type == 'cuda')
+            self.policy.parameters(), eps=1e-5, weight_decay=self.weight_decay, fused=self.device.type == 'cuda',
+            capturable=graphed, lr=torch.tensor(self.learning_rate, device=self.device) if graphed else self.learning_rate)
         self._epoch_end_indices = []
+        self._update_graph = None
         self._compile()
         self._cached_params = list(self.policy.parameters())
 
@@ -242,12 +247,16 @@ class PPO(BaseAlgorithm):
 
     def _compile(self) -> None:
         """Wrap the two regions: fullgraph torch.compile (production) or eager (debug).
-        ``loss_step(batch)`` is what ``train`` calls either way."""
+        ``loss_step(batch)`` is what ``train``'s loop calls either way; a graphed update calls the
+        loss inside its own CUDA graph, so it is compiled without one."""
         torch._inductor.config.fx_graph_cache = True
         self.loss_module = PPOLossModule(self.policy)
         if self.config.compile:
-            self._warmup_gradients()
             self._rollout_fn = torch.compile(self.rollout_step, mode=self.compile_mode, fullgraph=True)
+            if self._graphable():
+                self._compiled_loss = torch.compile(self._loss_step, fullgraph=True)
+                return
+            self._warmup_gradients()
             compiled_loss = torch.compile(self._loss_step, mode=self.compile_mode, fullgraph=True)
             self.loss_step = lambda batch: compiled_loss()
         else:
@@ -378,9 +387,89 @@ class PPO(BaseAlgorithm):
 
     # ── training ──────────────────────────────────────────────────────
 
+    def _graphable(self) -> bool:
+        """Train by replaying ONE captured minibatch update: compiled, on CUDA, whole minibatches and
+        no KL early stop (a host-side decision per minibatch)."""
+        return (self.config.compile and self.device.type == 'cuda' and self.target_kl is None
+                and (self.n_steps * self.n_envs) % self.batch_size == 0)
+
+    def _update(self) -> None:
+        """One minibatch update, on device only (the captured graph's body): gather the minibatch
+        the counter points at, normalize, the loss, backward, clip, AdamW, and record its losses."""
+        rb, i = self.rollout_buffer, self._mb
+        idx = self._perms.view(-1, self.batch_size).index_select(0, i).squeeze(0)
+        for k, buf in rb.flat_obs.items():
+            torch.index_select(buf, 0, idx, out=rb._batch_obs[k])
+        for src, dst in zip(self._scalars, rb._batch_scalar_dst_list):
+            torch.index_select(src, 0, idx, out=dst)
+        advantages, returns = rb._batch_advantages, rb._batch_returns
+        if self.normalize_returns:
+            returns.sub_(returns.mean()).div_(returns.std() + 1e-8)
+        if self.normalize_advantage:
+            advantages.sub_(advantages.mean()).div_(advantages.std() + 1e-8)
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+            loss, *losses = self._compiled_loss()
+        self._losses.index_copy_(0, i, torch.stack([x.detach().float() for x in losses]).unsqueeze(0))
+        loss.backward()
+        if self.max_grad_norm:
+            fused_clip_grad_norm_(self._cached_params, self.max_grad_norm)
+        self.optimizer.step()
+        i.add_(1)
+
+    def _capture_update(self) -> None:
+        """Capture :meth:`_update` once. Warming it up takes real optimizer steps, so the
+        parameters and the optimizer state are put back after: capturing trains nothing."""
+        rb, dev = self.rollout_buffer, self.device
+        n_batches = (self.n_steps * self.n_envs) // self.batch_size
+        self._mb = torch.zeros(1, dtype=torch.long, device=dev)
+        self._perms = torch.zeros(self.n_epochs, n_batches, self.batch_size, dtype=torch.long, device=dev)
+        self._scalars = [torch.zeros_like(t) for t in rb._scalar_flat_list]
+        self._losses = torch.zeros(self.n_epochs * n_batches, 5, device=dev)   # policy, value, entropy, kl, clip
+        params = [p.detach().clone() for p in self._cached_params]
+        state = {p: {k: v.clone() for k, v in st.items()} for p, st in self.optimizer.state.items()}
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                self.optimizer.zero_grad(set_to_none=True)
+                self._update()
+        self.optimizer.zero_grad(set_to_none=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):   # the warm-up's stream: autograd's accumulators live on it
+            self._update()
+        torch.cuda.current_stream().wait_stream(side)
+        with torch.no_grad():
+            for p, v in zip(self._cached_params, params):
+                p.copy_(v)
+            for p, st in self.optimizer.state.items():
+                for k, v in st.items():
+                    v.copy_(state[p][k]) if p in state else v.zero_()
+        self._update_graph = graph
+
+    def _train_graphed(self) -> Dict[str, Any]:
+        """The epochs as replays of the captured update over this roll-out's minibatches: the
+        permutations and the lane-major scalars :meth:`RolloutBuffer.get` would give."""
+        rb = self.rollout_buffer
+        n_batches, E = (self.n_steps * self.n_envs) // self.batch_size, self.n_epochs
+        if self._update_graph is None:
+            self._capture_update()
+        which = torch.arange(rb._perm_index, rb._perm_index + E) % rb._num_precomputed_perms
+        rb._perm_index = (rb._perm_index + E) % rb._num_precomputed_perms
+        self._perms.copy_(rb._precomputed_perms[which.to(self.device)].view_as(self._perms))
+        torch._foreach_copy_(self._scalars, [s.transpose(0, 1).reshape(-1) for s in
+                                             (rb.actions, rb.values, rb.log_probs, rb.advantages, rb.returns)])
+        self._mb.zero_()
+        for _ in range(E * n_batches):
+            self._update_graph.replay()
+        L = self._losses
+        return compute_train_metrics(self, L[:, 0], L[:, 1], L[:, 2], L[:, 4], L[:, 3],
+                                     E * n_batches, (E - 1) * n_batches)
+
     def train(self) -> Dict[str, Any]:
         """Update policy from rollout buffer using the compiled loss."""
         self.policy.train()
+        if self._graphable():
+            return self._train_graphed()
         n_batches = (self.n_steps * self.n_envs) // self.batch_size
         total = self.n_epochs * n_batches
 
@@ -453,7 +542,10 @@ class PPO(BaseAlgorithm):
                                config.lr_start, config.lr_end, config.lr_transform, warmup))
             self.learning_rate = lr
             for pg in self.optimizer.param_groups:
-                pg['lr'] = lr
+                if torch.is_tensor(pg['lr']):
+                    pg['lr'].fill_(lr)   # read on device by a graphed update
+                else:
+                    pg['lr'] = lr
         if config.ent_coef_decay:
             val = float(_anneal(progress, config.ent_coef_init_value, config.ent_coef_final_value,
                                 config.ent_coef_start, config.ent_coef_end, config.ent_coef_transform))
