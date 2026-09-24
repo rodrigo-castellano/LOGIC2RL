@@ -252,7 +252,8 @@ def _pack_children(
     after); invalid and overflow children target one discarded trash slot ``G``, so the first
     G children win. One scatter over the concatenated sources per output buffer (the two
     target regions are disjoint — half the kernel launches). Fact slots carry rule id -1,
-    rule slots their top-level rule id, empty slots 0."""
+    rule slots their top-level rule id, empty slots 0. The scatters are ``index_put_``: Inductor
+    lowers them to stores, an int64 ``scatter_`` to an eager kernel."""
     B, K_f = fact_success.shape
     L, W = rule_goals.shape[2], rule_goals.shape[3]
     dev = rule_goals.device
@@ -269,10 +270,10 @@ def _pack_children(
     out_rid = torch.zeros(B, G + 1, dtype=torch.long, device=dev)
 
     tgt = torch.cat([target_r, target_f], dim=1)                   # [B, K_r + K_f]
-    out_goals.scatter_(1, tgt.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, W),
-                       torch.cat([rule_goals, fact_goals], dim=1))
+    rows = torch.arange(B, device=dev).unsqueeze(1)
+    out_goals.index_put_((rows, tgt), torch.cat([rule_goals, fact_goals], dim=1))
     f_neg1 = torch.full((B, K_f), -1, dtype=torch.long, device=dev)
-    out_rid.scatter_(1, tgt, torch.cat([sub_rule_idx, f_neg1], dim=1))
+    out_rid.index_put_((rows, tgt), torch.cat([sub_rule_idx, f_neg1], dim=1))
 
     slot_valid = torch.arange(G, device=dev).unsqueeze(0) < counts.unsqueeze(1)
     rule_idx = torch.where(slot_valid, out_rid[:, :G], torch.zeros((), dtype=torch.long, device=dev))
@@ -315,7 +316,7 @@ def _compact_atoms(states: Tensor, pad: int, valid: Tensor) -> Tensor:
     pos = torch.cumsum(keep, dim=1, dtype=torch.long) - 1
     tgt = torch.where(keep, pos, M)
     out = flat.new_full((flat.shape[0], M + 1, W), pad)
-    out.scatter_(1, tgt.unsqueeze(-1).expand(-1, -1, W), flat)
+    out.index_put_((torch.arange(flat.shape[0], device=flat.device).unsqueeze(1), tgt), flat)   # a store once compiled
     return out[:, :M].reshape(*leading, M, W)
 
 __all__ = [

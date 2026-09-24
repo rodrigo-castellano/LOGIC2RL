@@ -124,11 +124,9 @@ class VisitMemoryComponent(EnvComponent):
         """Append the current state's hash to each active env's ring → (hashes, count)."""
         write_pos = history_count.clamp(max=self.max_history_size - 1)
         new_hash = self._compute_hash(current_states)
-        new_history = history_hashes.scatter(
-            1, write_pos.unsqueeze(1),
-            torch.where(active_mask.unsqueeze(1), new_hash.unsqueeze(1),
-                        history_hashes.gather(1, write_pos.unsqueeze(1))),
-        )
+        slot = torch.arange(history_hashes.shape[1], device=history_hashes.device)   # elementwise: Inductor fuses it
+        new_history = torch.where((slot == write_pos.unsqueeze(1)) & active_mask.unsqueeze(1),
+                                  new_hash.unsqueeze(1), history_hashes)
         new_count = torch.where(
             active_mask, (history_count + 1).clamp(max=self.max_history_size), history_count)
         return new_history, new_count

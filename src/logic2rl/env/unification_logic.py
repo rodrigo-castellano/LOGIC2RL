@@ -164,11 +164,13 @@ class UnificationLogic:
         target = torch.cumsum(keep.long(), dim=1) - 1                    # kept slot -> its front index
         target = torch.where(keep, target.clamp(min=0, max=S - 1), env._batch_ones.unsqueeze(1) * (S - 1))
         src = torch.where(keep.unsqueeze(-1), derived.reshape(bsz, S, flat), self._compact_scratch)
+        # index_put_, not scatter_: Inductor lowers it to a store, an int64 scatter_ to an eager kernel
+        rows = torch.arange(bsz, device=env.device).unsqueeze(1)
         compact = torch.full((bsz, S, flat), pad, dtype=torch.long, device=env.device)
-        compact.scatter_(1, target.unsqueeze(-1).expand(bsz, S, flat), src)
+        compact.index_put_((rows, target), src)
         derived = compact.view(bsz, S, A, W)
         packed_rid = torch.zeros((bsz, S), dtype=torch.long, device=env.device)   # rule id rides the same compaction
-        packed_rid.scatter_(1, target, torch.where(keep, rule_idx, torch.zeros_like(rule_idx)))
+        packed_rid.index_put_((rows, target), torch.where(keep, rule_idx, torch.zeros_like(rule_idx)))
         rule_idx = packed_rid
 
         # 2. No survivors -> a single FALSE state (the proof fails here).
